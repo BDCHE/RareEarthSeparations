@@ -1,13 +1,19 @@
 # Rare Earth Separation Lab
 
-This is a four-page [marimo](https://marimo.io) notebook (`notebook.py`) on separating La, Ce, Pr, Nd, Sm and Y by
-solvent extraction with PC88A / D2EHPA. It covers equilibrium, Fenske/Kremser staging, McCabe–Thiele
-with loading, an extraction/scrub cascade, mixer-settler dynamics and PI control.
+This is a four-page [marimo](https://marimo.io) notebook (`notebook.py`) about separating La, Ce, Pr, Nd, Sm and Y by
+solvent extraction with PC88A / D2EHPA. It is split evenly between two halves:
 
-1. **Concepts and governing equations**
-2. **Interactive lab** (six live sections)
-3. **Python code** (every function in full, plus an in-notebook test suite with a pass/fail table)
-4. **Attribution** (an AI-generated project: models, services, references and an author placeholder)
+* **Part A, Separations:** liquid–liquid extraction basics, equilibrium, Fenske/Kremser staging, McCabe–Thiele
+  with loading, and the extraction/scrub cascade.
+* **Part B, Process dynamics and control:** mixer-settler hydraulics and stage efficiency, start-up, step-test
+  identification (FOPDT and SIMC), and PI disturbance rejection.
+
+The four pages are:
+
+1. **Concepts and governing equations:** background on liquid–liquid extraction, plus a concept section for every lab section
+2. **Interactive lab:** sections 1–5 (Part A) and 6–9 (Part B)
+3. **Python code:** every function in full, plus an in-notebook test suite with a pass/fail table
+4. **Attribution:** an AI-generated project; lists models, services and references, with an author placeholder
 
 Dependencies are declared inline (PEP 723): `marimo`, `numpy`, `matplotlib`.
 

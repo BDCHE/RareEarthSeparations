@@ -446,10 +446,22 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
         ab, b, m, L, S = assemble(plant, **overrides)
         return implicit_euler_step(ab, b, m, np.zeros_like(b), 1e12)
 
-    def simulate_startup(plant, t_end=None, nsteps=1440):
+    def efficiency_sweep(plant, tau_mt_values):
+        """Steady product purities (raffinate light %, extract heavy %) for a range
+        of mass-transfer times: slower transfer -> lower stage efficiency."""
+        _, _, _, L, S = assemble(plant)
+        rows = []
+        for tmt in tau_mt_values:
+            u = steady_state(dict(plant, tau_mt=float(tmt)))
+            r, e = product_flows(u, L[0], S)
+            rows.append((100 * r[0] / r.sum(), 100 * e[1] / e.sum()))
+        return np.array(rows)
+
+    def simulate_startup(plant, t_end=None, nsteps=1440, snap_hours=(2, 6, 12, 24)):
         """Start from metal-free phases; feed switched on at t = 0.
         Purities are masked until each product carries 5 % of its steady flow.
-        Settling time: last time either purity is outside +/-1 point of steady."""
+        Settling time: last time either purity is outside +/-1 point of steady.
+        Stage profiles are stored at the times in `snap_hours`."""
         if t_end is None:
             t_end = float(np.clip(3.0 * plant["holdup"] / plant["F"], 48 * 60.0, 240 * 60.0))
         dt = t_end / nsteps
@@ -463,9 +475,13 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
         t = np.arange(nsteps + 1) * dt
         pr = np.full(nsteps + 1, np.nan)
         pe = np.full(nsteps + 1, np.nan)
+        snap_steps = {int(round(h * 60 / dt)): h for h in snap_hours if h * 60 <= t_end}
+        snaps = {}
         u = np.zeros_like(b)
         for k in range(1, nsteps + 1):
             u = band_solve(lu, b + (m / dt) * u)
+            if k in snap_steps:
+                snaps[snap_steps[k]] = u.copy()
             r, e = product_flows(u, L[0], S)
             if r.sum() >= 0.05 * r_ss.sum():
                 pr[k] = 100 * r[0] / r.sum()
@@ -479,10 +495,12 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
             t_settle = float("nan")           # not settled within the horizon
         else:
             t_settle = float(t[idx[-1] + 1])
-        return dict(t=t, pr=pr, pe=pe, pr_ss=pr_ss, pe_ss=pe_ss, t_settle=t_settle, u_ss=u_ss)
+        return dict(t=t, pr=pr, pe=pe, pr_ss=pr_ss, pe_ss=pe_ss, t_settle=t_settle,
+                    u_ss=u_ss, snaps=snaps)
 
     return (
         assemble,
+        efficiency_sweep,
         implicit_euler_step,
         make_plant,
         product_flows,
@@ -531,9 +549,64 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
             kw["dpH_ext"] = d["dpH_ext"]
         return kw
 
+    def step_test(plant, rel=0.05, t_end=None, nsteps=None):
+        """Open-loop step of the solvent flow S by `rel` (fraction) at t = 0,
+        starting from the nominal steady state. Returns the CV response."""
+        if t_end is None:
+            t_end = float(np.clip(2.25 * plant["holdup"] / plant["F"], 36 * 60.0, 200 * 60.0))
+        if nsteps is None:
+            nsteps = int(round(t_end / 2.0))
+        dt = t_end / nsteps
+        L1 = assemble(plant)[3][0]
+        u = steady_state(plant)
+        y0 = heavy_share_raffinate(u, L1)
+        S1 = plant["S"] * (1 + rel)
+        ab, b, m, L, _ = assemble(plant, S=S1)
+        A = ab.copy()
+        A[:, :, KL] += m / dt
+        lu = band_lu(A)
+        t = np.arange(nsteps + 1) * dt
+        y = np.zeros(nsteps + 1)
+        y[0] = y0
+        for k in range(1, nsteps + 1):
+            u = band_solve(lu, b + (m / dt) * u)
+            y[k] = heavy_share_raffinate(u, L[0])
+        y_inf = heavy_share_raffinate(steady_state(plant, S=S1), L[0])
+        return dict(t=t, y=y, y0=y0, y_inf=y_inf, dS=S1 - plant["S"])
+
+    def fopdt_smith(t, y, y0, y_inf):
+        """Smith's two-point method: fit y = y0 + K du (1 - exp(-(t - theta)/tau))
+        from the times at which 28.3 % and 63.2 % of the final change is reached:
+        tau = 1.5 (t63 - t28), theta = t63 - tau."""
+        frac = (np.asarray(y) - y0) / (y_inf - y0)
+
+        def first_crossing(level):
+            i = int(np.argmax(frac >= level))
+            if i == 0:
+                return float("nan")       # never reached within the horizon
+            return float(t[i - 1] + (level - frac[i - 1]) * (t[i] - t[i - 1]) / (frac[i] - frac[i - 1]))
+
+        t28, t63 = first_crossing(0.283), first_crossing(0.632)
+        tau = 1.5 * (t63 - t28)
+        return dict(t28=t28, t63=t63, tau=tau, theta=max(t63 - tau, 0.0))
+
+    def fopdt_response(t, y0, K, du, tau, theta):
+        """First-order-plus-dead-time step response."""
+        t = np.asarray(t, float)
+        return y0 + K * du * np.where(t > theta, 1.0 - np.exp(-(t - theta) / tau), 0.0)
+
+    def simc_tuning(tau, theta_total, tau_c=None):
+        """SIMC PI rule (Skogestad, 2003) for an FOPDT process, written as a loop
+        gain: LG = Kc |Kp| = tau / (tau_c + theta), Ti = min(tau, 4 (tau_c + theta)).
+        The default closed-loop time constant is tau_c = theta (the 'tight' choice)."""
+        tau_c = theta_total if tau_c is None else tau_c
+        return dict(LG=tau / (tau_c + theta_total), Ti=min(tau, 4.0 * (tau_c + theta_total)), tau_c=tau_c)
+
     def simulate_disturbance(plant, name, closed_loop, LG=2.0, Ti=120.0, delay=10.0,
                              t_end=None, nsteps=None, limit=0.5):
-        """Step disturbance at t = 0 from the nominal steady state."""
+        """Step disturbance at t = 0 from the nominal steady state. Also records the
+        (uncontrolled) extract purity, the integral of absolute error and the
+        fraction of time the solvent flow sits on a limit."""
         if t_end is None:
             t_end = float(np.clip(2.25 * plant["holdup"] / plant["F"], 36 * 60.0, 200 * 60.0))
         if nsteps is None:
@@ -550,7 +623,10 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         t = np.arange(nsteps + 1) * dt
         cv = np.zeros(nsteps + 1)
         s_hist = np.zeros(nsteps + 1)
+        ext = np.zeros(nsteps + 1)
         cv[0], s_hist[0] = sp, S0
+        e_flow = S0 * u[:, -1]
+        ext[0] = 100.0 * e_flow[1] / e_flow.sum()
         integral, S = 0.0, S0
         lo, hi = (1 - limit) * S0, (1 + limit) * S0
         cached_S, lu = None, None
@@ -563,6 +639,8 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
             u = band_solve(lu, b + (m / dt) * u)
             cv[k] = heavy_share_raffinate(u, L[0])
             s_hist[k] = S
+            e_flow = S * u[:, -1]
+            ext[k] = 100.0 * e_flow[1] / e_flow.sum()   # heavy purity of the extract
             if closed_loop:
                 measured = cv[max(0, k - nd)]       # analyzer dead time
                 e = measured - sp                   # too much heavy -> more solvent
@@ -570,10 +648,24 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
                 if lo < trial < hi or (trial >= hi and e < 0) or (trial <= lo and e > 0):
                     integral += e * dt              # conditional integration
                 S = float(np.clip(S0 + Kc * (e + integral / Ti), lo, hi))
-        return dict(t=t, cv=cv, S=s_hist, sp=sp, Kp=Kp, Kc=Kc,
-                    peak=float(np.max(np.abs(cv - sp))), final=float(cv[-1]))
+        dev = np.abs(cv - sp)
+        on_limit = (np.abs(s_hist - lo) < 1e-9) | (np.abs(s_hist - hi) < 1e-9)
+        return dict(t=t, cv=cv, S=s_hist, ext=ext, sp=sp, Kp=Kp, Kc=Kc,
+                    peak=float(np.max(dev)), t_peak=float(t[int(np.argmax(dev))]),
+                    final=float(cv[-1]),
+                    iae=float(np.sum(0.5 * (dev[1:] + dev[:-1])) * dt / 60.0),  # point-hours
+                    sat_frac=float(np.mean(on_limit)))
 
-    return DISTURBANCES, heavy_share_raffinate, process_gain, simulate_disturbance
+    return (
+        DISTURBANCES,
+        fopdt_response,
+        fopdt_smith,
+        heavy_share_raffinate,
+        process_gain,
+        simc_tuning,
+        simulate_disturbance,
+        step_test,
+    )
 
 
 @app.cell
@@ -585,7 +677,10 @@ def _(
     band_to_dense,
     cascade_steady,
     distribution_ratio,
+    efficiency_sweep,
     fenske_nmin,
+    fopdt_response,
+    fopdt_smith,
     implicit_euler_step,
     assemble,
     kremser_raffinate_fraction,
@@ -593,9 +688,12 @@ def _(
     mccabe_thiele,
     np,
     pH50,
+    process_gain,
     separation_factor,
+    simc_tuning,
     simulate_disturbance,
     simulate_startup,
+    step_test,
 ):
     # -------------------------------------------------------------------- tests
     def run_tests():
@@ -666,6 +764,39 @@ def _(
         check("raffinate heavy share after feed +20%, open loop (%)", 28.9, ol["final"], 0.1)
         check("open-loop peak deviation (points)", 6.9, ol["peak"], 0.1)
         check("PI peak deviation, LG 2, Ti 120, delay 10 (points)", 1.8, cl["peak"], 0.1)
+        check("PI removes the offset (final CV - setpoint, points)", 0.0, cl["final"] - cl["sp"], 0.05)
+        check("PI integral of absolute error below open loop (IAE ratio < 1)", 0.0,
+              max(0.0, cl["iae"] / ol["iae"] - 1.0), 1e-12)
+
+        # stage efficiency: slower mass transfer must lower both purities
+        sweep = efficiency_sweep(plant, [0.2, 0.5, 1.0])
+        check("efficiency sweep at tau_mt = 12 s matches start-up steady state", st["pr_ss"], sweep[0, 0], 1e-9)
+        check("purity falls as tau_mt grows (monotone)", 0.0,
+              float(np.sum(np.diff(sweep, axis=0) > 0)), 0.0)
+
+        # process identification and tuning
+        up = step_test(plant, +0.05)
+        down = step_test(plant, -0.05)
+        k_up = (up["y_inf"] - up["y0"]) / up["dS"]
+        k_down = (down["y_inf"] - down["y0"]) / down["dS"]
+        check("mean of +/-5 % step gains = central-difference Kp", process_gain(plant),
+              0.5 * (k_up + k_down), 1e-9)
+        check("step test reaches its new steady state (points)", up["y_inf"], up["y"][-1], 0.05)
+        tt = np.linspace(0, 600, 6001)
+        fit = fopdt_smith(tt, fopdt_response(tt, 0.0, 2.0, 1.0, 100.0, 20.0), 0.0, 2.0)
+        check("Smith two-point fit recovers tau = 100 min", 100.0, fit["tau"], 0.5)
+        check("Smith two-point fit recovers theta = 20 min", 20.0, fit["theta"], 0.5)
+        simc = simc_tuning(10.0, 2.0)
+        check("SIMC loop gain, tau 10, theta 2", 2.5, simc["LG"], 1e-12)
+        check("SIMC integral time, tau 10, theta 2", 10.0, simc["Ti"], 1e-12)
+
+        # actuator limits and anti-windup: a +/-20 % limit forces saturation
+        hard = simulate_disturbance(plant, "Extraction pH −0.05", True, LG=5.0, Ti=30.0,
+                                    delay=10.0, limit=0.2)
+        check("solvent flow never exceeds +20 % limit (excess, L/min)", 0.0,
+              max(0.0, float(hard["S"].max()) - 1.2 * plant["S"]), 1e-12)
+        check("solvent flow actually saturates in that case (1 = yes)", 1.0,
+              float(hard["sat_frac"] > 0.1), 0.0)
         return results
 
     return (run_tests,)
@@ -713,104 +844,400 @@ def _(PAGES, mo, nav):
         r"""
 ## 1 · Concepts and governing equations
 
-### Why rare earths are hard to separate
-La, Ce, Pr, Nd, Sm and Y are all trivalent in acid solution and almost the same size, so no single
-chemical step separates them. Industry uses **solvent extraction**: an aqueous chloride solution is
-mixed with kerosene holding an acidic organophosphorus extractant (PC88A, also sold as P507 or HEH/EHP; or
-D2EHPA). Smaller, heavier lanthanides bind slightly more strongly, so each contact enriches the
-organic phase in the heavier element. Many contacts in counter-current cascades of
-mixer-settlers turn small differences into high purity.
+This project has two equal halves. **Part A, Separations** explains how liquid–liquid extraction separates rare
+earths, from one contact to a full cascade. **Part B, Process dynamics and control** explains how a real plant of
+mixer-settlers behaves over time and how a feedback controller holds product quality. Every slider, chart and
+number on page 2 is explained in the section listed here.
 
-### Extraction chemistry
-The extractant exists as a hydrogen-bonded dimer $(\mathrm{HA})_2$. A metal ion swaps its charge for three protons:
+| Lab section (page 2) | Concepts on this page |
+|---|---|
+| 1 · % extracted vs pH | A1, A2, A3, A4 |
+| 2 · Separation factors and Fenske | A5 |
+| 3 · Kremser recovery vs stages | A6 |
+| 4 · McCabe–Thiele with stair steps | A7 |
+| 5 · Extraction / scrub cascade | A8 |
+| 6 · Mixer-settler hydraulics and stage efficiency | B1, B2, B3, B4 |
+| 7 · Start-up dynamics | B4, B5 |
+| 8 · Step test, process model and PI tuning | B6, B7 |
+| 9 · Disturbance rejection with PI control | B7, B8, B9 |
+"""
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(PAGES, mo, nav):
+    mo.stop(nav.value != PAGES[0])
+    mo.md(
+        r"""
+---
+## Part A · Separations
+
+### A1 · Liquid–liquid extraction: how it works
+**Liquid–liquid extraction** (also called **solvent extraction**, SX) moves a dissolved substance from one liquid
+into a second liquid that does not mix with the first.
+
+* **The two phases.** The **aqueous phase** is water carrying the metals, here a chloride solution from
+  leaching the ore. The **organic phase** (the "solvent") is an oil-like liquid that floats on water. It has three parts:
+  * an **extractant**, the molecule that grabs the metal (PC88A or D2EHPA here);
+  * a **diluent**, usually kerosene, which carries the extractant and sets the viscosity and density;
+  * sometimes a **modifier** (for example a long-chain alcohol or TBP), which stops a third liquid phase from forming
+    at high loading.
+* **Contact, then separation.** The two liquids are stirred together so that one breaks into fine droplets inside the
+  other. The large interfacial area lets metal ions cross between the phases quickly. When stirring stops, the droplets
+  **coalesce** and the lighter organic rises above the aqueous. The phases are then drawn off separately.
+  Each contact-and-settle step is a **stage**.
+* **Equilibrium.** If contact lasts long enough, each metal settles at a fixed ratio between the phases, the
+  **distribution ratio** $D = [\mathrm{M}]_{org}/[\mathrm{M}]_{aq}$. Different metals have different $D$, and that
+  difference is what separates them.
+* **Names of the streams.** The aqueous liquor leaving extraction, stripped of the extractable metals, is the
+  **raffinate**. The organic carrying metal away is the **loaded organic** or **extract**. **Scrubbing** washes the
+  loaded organic with a small aqueous stream to knock back weakly held metals. **Stripping** (not modelled here)
+  contacts the organic with strong acid to recover the metal and **regenerate** the solvent, which is then recycled.
+* **Phase ratio O/A.** This is the ratio of organic to aqueous volume (in a batch) or flow (in a continuous plant). More
+  organic per litre of aqueous takes up more metal.
+* **Counter-current flow.** In a plant, the two phases flow through a train of stages in **opposite directions**. The
+  freshest solvent meets the most depleted aqueous, and the most loaded solvent meets the richest feed. This keeps a
+  driving force for transfer in every stage. It recovers far more per stage than cross-current or co-current
+  contacting, and it is the basis of sections 3, 4 and 5 of the lab.
+* **Practical problems that the model ignores.** These include **entrainment** (droplets of one phase carried out with
+  the other), **crud** (stable solids-stabilised emulsion at the interface), **third-phase** formation at high loading, and
+  extractant losses.
+
+**Families of extractants.** **Acidic (cation-exchange) extractants** swap protons for metal ions. Examples are D2EHPA
+(P204), PC88A (P507, HEH/EHP) and Cyanex 272; these are the workhorses for rare earths in chloride media.
+**Solvating extractants** such as TBP carry neutral metal salts and are used in nitrate media. **Amine and quaternary
+ammonium extractants** such as Aliquat 336 extract anionic complexes. This lab uses the acidic type.
+
+**Saponification.** An acidic extractant releases $\mathrm{H^+}$ as it loads, which lowers the pH and weakens further
+extraction (A3). Plants therefore often pre-neutralise part of the extractant with NaOH or ammonia (**saponification**)
+to hold the pH up. The lab assumes the pH in each stage is fixed, as if acidity were controlled perfectly.
+
+### A2 · Why rare earths are hard to separate
+La, Ce, Pr, Nd and Sm are lanthanides, and they and Y are all trivalent ($\mathrm{M^{3+}}$) in acid solution.
+Across the lanthanide series the ionic radius shrinks slightly with each step in atomic number (the
+**lanthanide contraction**). A smaller ion has a higher charge density and binds the extractant a little more
+strongly, so $D$ rises steadily through the series:
+
+$$\text{La} < \text{Ce} < \text{Pr} < \text{Nd} < \text{Sm} < \dots$$
+
+**Yttrium** is not a lanthanide, but its ionic radius is close to that of holmium, so it extracts with the heavy rare
+earths, far above Sm. Neighbours differ only by factors of about 1.5–4, so a single contact gives only a small
+enrichment. Industrial plants therefore use counter-current cascades of many stages, often several tens for a hard
+pair such as Pr/Nd.
+
+### A3 · Extraction chemistry and the distribution ratio  → *Lab 1*
+The extractant exists as a hydrogen-bonded dimer $(\mathrm{HA})_2$. A metal ion trades its charge for three protons:
 
 $$\mathrm{M^{3+}_{(aq)}} + 3\,(\mathrm{HA})_{2\,(org)} \rightleftharpoons \mathrm{M(HA_2)_{3\,(org)}} + 3\,\mathrm{H^+_{(aq)}}$$
 
-The distribution ratio $D = [\mathrm{M}]_{org}/[\mathrm{M}]_{aq} = K_{ex}[(\mathrm{HA})_2]^3/[\mathrm{H^+}]^3$, so
-$\log_{10}D$ rises by 3 per pH unit and by 3 per decade of extractant. The lab uses
+With equilibrium constant $K_{ex}$, the distribution ratio is
+$D = K_{ex}\,[(\mathrm{HA})_2]^3 / [\mathrm{H^+}]^3$. Taking logs:
+
+* **pH:** each unit of pH increases $\log_{10} D$ by **3**, because three $\mathrm{H^+}$ are released. Raising pH
+  pulls metal into the organic, and lowering pH (adding acid) pushes it back. This is why acid is used for scrubbing
+  and stripping.
+* **Extractant concentration $C$:** $[(\mathrm{HA})_2] \approx C/2$ when little metal is loaded, so a tenfold
+  increase in $C$ raises $\log_{10} D$ by **3**.
+
+The lab writes this relative to a reference state (pH 2.0, $C$ = 0.5 mol/L as HA):
 
 $$\log_{10} D = \mathrm{idx} + 3\,(\mathrm{pH} - 2.0) + 3\,\log_{10}\!\left(\frac{C}{0.5}\right)$$
 
-where $C$ is the extractant concentration (mol/L as HA) and idx is $\log_{10}D$ at pH 2.0 and
-$C = 0.5$ M, relative to Nd:
+Here **idx** is $\log_{10} D$ of each element at the reference state, relative to Nd:
 
 | Element | La | Ce | Pr | Nd | Sm | Y |
 |---|---|---|---|---|---|---|
 | idx | −1.0792 | −0.4771 | −0.1761 | 0 | +0.8451 | +2.4472 |
 
-Adjacent **separation factors** $\beta = D_{heavy}/D_{light} = 10^{\Delta \mathrm{idx}}$ are therefore
-Ce/La = 4, Pr/Ce = 2 and Nd/Pr = 1.5 (from US patent 10,227,676), and **Sm/Nd = 7 and Y/Sm = 40, which are teaching
-estimates**. The literature search on page 4 found PC‑88A Nd/Pr ≈ 1.4 (close to 1.5), and
-β values that vary strongly with acid, pH and loading (Ce/La from about 4 to more than 50). None of the sources
-gave a usable PC88A Sm/Nd or Y/Sm under comparable conditions, so **no idx value was changed**.
+The Lab 1 slider **Extractant C** shifts every curve sideways by $-\log_{10}(C/0.5)$ pH units. The **Elements**
+selector chooses which curves to draw. The table under the chart lists $D$ at pH 2.3.
 
-**pH of half extraction** ($D = 1$):
+### A4 · One equilibrium stage, pH50 and the Ce(IV) switch  → *Lab 1*
+In one batch contact at phase ratio O/A, the **extraction factor** is $E = D\cdot O/A$. A mass balance gives the
+fraction extracted:
+
+$$\%\,\text{extracted} = \frac{100\,E}{1+E}$$
+
+This is an S-shaped curve against pH. The **pH of half extraction**, where $D = 1$ (50 % at O/A = 1), is
+
 $$\mathrm{pH}_{50} = 2 - \frac{\mathrm{idx}}{3} - \log_{10}\!\left(\frac{C}{0.5}\right)$$
 
-**One equilibrium stage** with organic-to-aqueous ratio O/A:
-$$E = D\cdot\frac{O}{A},\qquad \%\text{extracted} = \frac{100\,E}{1+E}$$
+At other phase ratios, 50 % extraction needs $D\cdot O/A = 1$, so the curve moves by
+$-\log_{10}(O/A)/3$. The dots in Lab 1 sit at that point, and the table lists both pH values. The horizontal gap
+between two curves is $\Delta\mathrm{idx}/3$. A pH that extracts most of one element while leaving most of its
+neighbour behind exists only when that gap is wide.
 
-**Ce(IV) switch (illustrative).** Oxidising cerium to Ce(IV) makes it extract far more strongly. The lab
-models this by adding $+4$ to $\log_{10}D_{Ce}$. This inverts the Ce/Pr order and makes Ce removal easy.
+**Ce(IV) switch (illustrative).** Cerium is the one light rare earth that can be oxidised to $\mathrm{Ce^{4+}}$, which
+extracts far more strongly than any $\mathrm{M^{3+}}$. The lab models this by adding $+4$ to $\log_{10}D_{Ce}$, which
+moves Ce about 1.3 pH units to the left. Ce then separates easily from La and Pr. Real oxidation chemistry is not modelled.
 
-### Staging
-**Fenske (total reflux).** The minimum number of stages for 99.9 % purity in both products is
-$$N_{min} = \frac{\ln(999^2)}{\ln \beta}$$
-which gives about 10 stages for $\beta = 4$ and about 34 for $\beta = 1.5$.
+### A5 · Separation factor and the Fenske minimum  → *Lab 2*
+The **separation factor** of a pair is $\beta = D_{heavy}/D_{light}$. In this model pH and $C$ shift both $D$
+values equally, so $\beta = 10^{\Delta\mathrm{idx}}$ is constant:
 
-**Kremser (counter-current extraction, fresh solvent, constant D).** The fraction of a metal left in the raffinate after $N$ stages is
-$$\varphi = \frac{E-1}{E^{N+1}-1}\qquad(\varphi = \tfrac{1}{N+1}\ \text{at}\ E=1)$$
-When $E<1$, even infinitely many stages recover only a fraction $E$, because $\varphi \to 1-E$. This is the *E < 1 ceiling*.
+| Pair | Ce/La | Pr/Ce | Nd/Pr | Sm/Nd | Y/Sm |
+|---|---|---|---|---|---|
+| β | 4 | 2 | 1.5 | 7 | 40 |
+| Source | US 10,227,676 | US 10,227,676 | US 10,227,676 | teaching estimate | teaching estimate |
 
-**McCabe–Thiele with loading.** The extractant saturates at $Q = C/6$ (six HA per metal), so the isotherm is
-$$y = \frac{D x}{1 + D x / Q}$$
-The operating line from a balance over stages $n..N$ is $x_{n-1} = x_N + (O/A)\,y_n$. The raffinate $x_N$ is
-found by bisection: guess $x_N$, step up the stages to $x_0$, and repeat until $x_0 = x_F$.
+The literature search (page 4) found PC‑88A Nd/Pr ≈ 1.4, consistent with 1.5. Published β values vary widely with
+the acid medium, pH and loading; Ce/La ranges from about 4 to more than 50. No usable PC88A Sm/Nd or Y/Sm value was found, so
+**those two remain estimates and no idx value was changed**. In Lab 2 these bars are **hatched**.
 
-### Extraction / scrub cascade
-Stages $1..N$ with $N = n_{Ext} + n_{Scr}$. Fresh solvent $S$ enters stage 1 and leaves loaded at stage $N$ (heavy product).
-Scrub liquor $W$ enters stage $N$, and the aqueous phase leaves at stage 1 (light product, the raffinate). The feed $F$
-(concentration $c_F$) enters at stage $f = n_{Ext}$. The aqueous flow is $L(n) = W + F$ for $n \le f$ and $W$ after. $D$
-is evaluated at the extraction pH in stages $1..f$ and at the scrub pH after. Each element obeys
+The **Fenske equation** gives the fewest stages that could reach purity $P$ in **both** products. It assumes total
+reflux, the limit of infinite internal recycle:
+
+$$N_{min} = \frac{\ln\!\big[(P/(1-P))^2\big]}{\ln \beta}\qquad\Big(P = 0.999:\ N_{min} = \frac{\ln 999^2}{\ln\beta}\Big)$$
+
+β = 4 needs about 10 stages and β = 1.5 about 34. A real plant at finite flows needs more. The **Target purity**
+slider sets $P$. With the Ce(IV) switch on, Pr/Ce becomes smaller than 1 (Ce now extracts first). Lab 2 shows it as
+"Ce/Pr (inverted)", using $\max(\beta, 1/\beta)$.
+
+### A6 · Counter-current extraction: the Kremser equation  → *Lab 3*
+Consider $N$ ideal stages in counter-current flow, with metal-free solvent entering and a constant extraction factor
+$E = D\cdot O/A$. The fraction of a metal left in the raffinate is
+
+$$\varphi = \frac{E-1}{E^{N+1}-1}\qquad\Big(\varphi = \tfrac{1}{N+1}\ \text{when}\ E = 1\Big),\qquad \text{recovery} = 1-\varphi$$
+
+* If $E > 1$, recovery approaches 100 % as stages are added.
+* If $E < 1$, there is a **ceiling**: $\varphi \to 1-E$, so even infinitely many stages recover only a fraction $E$.
+  The solvent simply cannot carry more. These ceilings are the dashed lines in Lab 3.
+* $E = 1$ is the boundary, where recovery grows as $N/(N+1)$.
+
+The Lab 3 **pH** and **O/A** sliders change $E$ for every element at once. Because the elements have different $E$,
+the same stages recover them to different degrees, and that is how staging separates them.
+
+### A7 · Loading limits and the McCabe–Thiele construction  → *Lab 4*
+Each metal ion takes up three dimers, that is six HA. The organic is therefore **saturated** at
+$Q = C/6$ (mol/L of metal; 83.3 mmol/L at C = 0.5 M). A simple isotherm that captures this saturation is
+
+$$y = \frac{D\,x}{1 + D\,x/Q}$$
+
+where $x$ is the aqueous concentration and $y$ the organic concentration. Near zero it is a straight line of slope $D$,
+and it flattens towards $Q$. This curved isotherm is why the graphical **McCabe–Thiele** method is used instead of Kremser.
+
+* **Operating line.** A metal balance over stages $n..N$, with fresh solvent entering stage $N$, gives
+  $x_{n-1} = x_N + (O/A)\,y_n$. This is a straight line of slope $A/O$ through $(x_N, 0)$ and $(x_F, y_1)$.
+* **Stair steps.** Each stage is one step. Move horizontally from the operating line to the isotherm (the stage
+  reaches equilibrium), then vertically back to the operating line (the balance to the next stage).
+* **Solution by bisection.** For a given number of stages $N$, guess the raffinate $x_N$, step up through the
+  stages to compute $x_0$, and adjust $x_N$ by bisection until $x_0$ equals the feed $x_F$.
+
+The Lab 4 sliders set the element, feed concentration, O/A, pH and $C$ (which changes both $D$ and $Q$), and the
+number of stages. The table lists the raffinate for 1–8 stages. With Nd at 40 mmol/L, O/A 1 and pH 2.3, it gives
+6.910, 1.122, 0.152 and 0.019 mmol/L for $N$ = 1–4.
+
+### A8 · The extraction / scrub cascade  → *Lab 5*
+To split a binary mixture into two products, a **light** element (lower $D$, leaves in the raffinate) and a
+**heavy** element (higher $D$, leaves in the extract), the feed enters the middle of a cascade:
+
+* **Stages $1..N$**, with $N = n_{Ext} + n_{Scr}$. The **extraction section** is stages $1..n_{Ext}$ and the
+  **scrub section** is stages $n_{Ext}+1..N$. The feed enters stage $f = n_{Ext}$.
+* **Fresh solvent $S$** enters stage 1 and leaves loaded from stage $N$: this is the **heavy product (extract)**.
+  The extraction section strips the heavy element out of the aqueous phase.
+* **Scrub liquor $W$** (dilute acid) enters stage $N$ and flows down. It washes co-extracted light element out of
+  the organic phase and back towards the raffinate. The aqueous leaves at stage 1 as the **light product (raffinate)**.
+* **Aqueous flow:** $L(n) = W + F$ in the extraction section and $W$ in the scrub section.
+* **Two pH values:** $D$ is evaluated at the **extraction pH** in stages $1..f$ and at the lower **scrub pH** after.
+  A lower pH lowers $D$, which helps the scrub liquor take the light element back. The flows **S** and **W** are
+  given per unit of feed flow ($F = 1$).
+
+**Stage balance.** In each stage, the metal entering equals the metal leaving:
 
 $$S\,D(n-1)\,x(n-1) - \big(S\,D(n)+L(n)\big)\,x(n) + L(n+1)\,x(n+1) = -F\,c_F\,[n=f]$$
 
-This is a tridiagonal system per element, solved with the Thomas algorithm. **Validity check:** if the peak total
-organic loading $\sum_i D_i x_i$ exceeds $Q$, the constant‑D assumption is broken and the result is flagged.
+Here $c_F$ is the feed concentration of that element (**Feed total** × its **heavy fraction** or light fraction).
+Each element gives one **tridiagonal** system, solved directly by the Thomas algorithm. Because $D$ is constant, the
+elements do not interact.
 
-### Mixer–settlers
-Residence times are $\tau = V/(S + L_n)$ for mixer and settler. Transfer in the mixer is first order with time
-constant $\tau_{mt}$, so a mixer approaches equilibrium to
+**Extraction factors.** In stage $n$ the extraction factor is $E_n = S\,D_n/L_n$. Good separation needs the heavy
+element at $E > 1$ (carried up into the extract) and the light element at $E < 1$ (washed down into the raffinate), in
+both sections. Since $E_{light} = E_{heavy}/\beta$, a small β leaves only a narrow window. The Pr|Nd default sits close
+to its edges, which is why 20 stages give only about 79.6 % purity. Lab 5 lists these factors under the stat tiles.
+
+**What Lab 5 reports.**
+* **Purity:** the share of the wanted element in a product's metal flow. Raffinate purity is light/(light + heavy) in
+  the raffinate, and extract purity is heavy/(light + heavy) in the extract.
+* **Recovery:** the fraction of an element's feed that reaches its own product. There is a trade-off: pushing one
+  product purer usually costs recovery of the other element.
+* **Concentration profiles:** aqueous $x$ and organic $y$ in every stage. Both elements usually peak near the feed
+  stage at concentrations above the feed itself. The cascade recycles metal internally: the scrub section sends
+  metal back down, the extraction section picks it up again, and an inventory builds up around the feed. The light
+  element falls away towards the extract end and the heavy element towards the raffinate end.
+* **Fenske $N_{min}$** for the pair, as a benchmark for the number of stages you chose.
+* **Loading check.** If the peak total organic loading $\sum_i D_i x_i$ exceeds $Q = C/6$, the constant‑D model is
+  invalid and a red warning appears. A higher **Feed total** raises the loading, while the **Feed heavy fraction**
+  changes the split of metal between the two products.
+
+Industrial circuits also **reflux** part of a pure product back into the scrub or extraction section, which allows
+higher purity with fewer stages. This model has no reflux.
+
+### A9 · Assumptions in Part A
+* $D$ follows the slope-3 law with fixed separation factors, with no activity, loading or temperature effects except the loading check.
+* The pH is fixed in each stage, as if saponification or acid addition were perfect.
+* Stages are ideal: equilibrium is reached and the phases separate completely, with no entrainment, crud or third phase.
+* There is no reflux and no stripping section: solvent enters metal-free.
+* The Sm/Nd and Y/Sm separation factors, the Ce(IV) shift and the feed concentration (100 mmol/L) are teaching estimates.
+"""
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(PAGES, mo, nav):
+    mo.stop(nav.value != PAGES[0])
+    mo.md(
+        r"""
+---
+## Part B · Process dynamics and control
+
+### B1 · Why dynamics matter in a solvent-extraction plant
+A rare-earth SX plant holds a large inventory of liquid and metal, and it responds slowly. The lab's Pr|Nd plant has
+20 stages of 48 L each, **960 L in total**. At 1 L/min of feed, that is 16 h of feed flow. Three consequences follow:
+
+* **Start-up takes about a day.** The internal concentration profiles must fill before the products reach specification
+  (Lab 7).
+* **Disturbances act slowly but last.** A change in feed or acidity drifts the product purity over many hours, and an
+  operator who reacts to a delayed laboratory assay is always behind. Off-spec product may have to be reprocessed.
+* **Feedback control helps.** An on-line analyzer and a controller can hold quality much more tightly than open-loop
+  operation (Labs 8–9), but only within the limits set by dead time, gain and equipment constraints.
+
+### B2 · Mixer-settler hydraulics  → *Lab 6*
+A **mixer-settler** is the usual stage in rare-earth plants. A small stirred **mixer** (volume $V_{mix}$) disperses
+the phases. A larger quiescent **settler** ($V_{set}$) lets them separate, and each phase flows on to its neighbour in
+opposite directions. The **residence time** is the volume divided by the total flow through it:
+
+$$\tau_{mix} = \frac{V_{mix}}{S + L_n},\qquad \tau_{set} = \frac{V_{set}}{S + L_n}$$
+
+$L_n$ is larger in the extraction section ($W + F$) than in the scrub section ($W$), so scrub stages have longer
+residence times. This is the step in the Lab 6 bar chart. With F = 1 L/min, the defaults give
+**1.84 / 9.20 min** (extraction) and **2.39 / 11.94 min** (scrub). The flows scale with the **feed flow F**: S and W
+from Lab 5 are multiplied by F. Doubling F halves every residence time.
+
+**Hold-up** is $N(V_{mix} + V_{set})$. **Hold-up ÷ feed flow** is a rough hydraulic clock for the whole plant. The
+volume in each unit is split between the phases in the **nominal flow ratio**, with organic fraction
+$\phi_o = S/(S+L_n)$.
+
+### B3 · Mass-transfer rate and stage efficiency  → *Lab 6*
+Real stages do not reach equilibrium. Assume transfer in the mixer is **first order** with time constant
+$\tau_{mt}$ (12 s here):
+
+$$\text{rate of transfer to the organic} = \frac{V_o^{m}\,(D\,x_m - y_m)}{\tau_{mt}}$$
+
+Here $V_o^m$ is the organic volume in the mixer. In a well-mixed vessel with residence time $\tau_{mix}$, the
+**approach to equilibrium** (a stage efficiency) is
+
 $$\eta = \frac{\tau_{mix}}{\tau_{mix} + \tau_{mt}}$$
 
-**Dynamic model.** Each stage is a perfectly mixed mixer (states $x_m, y_m$) followed by a lumped settler
-(states $x_s, y_s$). Phase volumes are split by the nominal flow ratio $\phi_o = S/(S+L_n)$. For each element:
+This gives about 0.90 in extraction and 0.92 in scrub at the defaults. Lower efficiency works like having fewer stages.
+The second chart in Lab 6 sweeps $\tau_{mt}$ from 1 to 120 s and shows both purities falling below their
+ideal-stage values (dotted). At 12 s, purity drops from 79.6 % to about 78.1 % (raffinate) and 78.8 % (extract).
+A larger **mixer volume** raises $\eta$; the **settler volume** only adds hold-up and delay.
+
+### B4 · The dynamic model and how it is solved  → *Labs 6–9*
+Each stage is a perfectly mixed mixer (states $x_m, y_m$) followed by a lumped, perfectly mixed settler
+($x_s, y_s$), for each element. The aqueous phase enters mixer $n$ from settler $n+1$ (plus the feed at stage $f$),
+and the organic enters from settler $n-1$:
 
 $$V_a^{m}\dot x_m = L_{n+1}x_s^{(n+1)} + F c_F[n=f] - L_n x_m - V_o^{m}\,\frac{D x_m - y_m}{\tau_{mt}}$$
 $$V_o^{m}\dot y_m = S\,y_s^{(n-1)} - S\,y_m + V_o^{m}\,\frac{D x_m - y_m}{\tau_{mt}}$$
-$$V_a^{s}\dot x_s = L_n (x_m - x_s),\qquad V_o^{s}\dot y_s = S(y_m - y_s)$$
+$$V_a^{s}\dot x_s = L_n (x_m - x_s),\qquad V_o^{s}\dot y_s = S\,(y_m - y_s)$$
 
-With the unknowns ordered $[x_m, y_m, x_s, y_s]$ stage by stage, the matrix is banded with half-bandwidth 6.
-It is integrated by **implicit Euler**, $(M/\Delta t + A)u^{k+1} = (M/\Delta t)u^k + b$, using a banded LU solver.
-The steady state is one step with a huge $\Delta t$. Start-up begins with metal-free phases. Product purities are
-masked until each product carries 5 % of its steady metal flow. The settling time is the last time either purity
-is outside ±1 point of its steady value.
+The superscripts $a$ and $o$ mark the aqueous and organic volumes. This is a linear system $M\dot u = -A u + b$ with
+$4N$ unknowns per element.
 
-### PI control
-* **Controlled variable:** heavy-element share (%) in the raffinate, measured by an on-line analyzer with dead time $\theta$.
-* **Manipulated variable:** solvent flow $S$, limited to ±50 % of nominal.
-* **Controller:** $S = S_0 + K_c\big(e + \tfrac{1}{T_i}\int e\,dt\big)$ with $e = y_{meas} - y_{sp}$ (more heavy element in the
-  raffinate calls for more solvent). The integral is frozen while the output is saturated and the error would drive it further (**conditional-integration anti-windup**).
-* **Tuning:** $K_p$ is found from a ±5 % steady-state perturbation of $S$, and $K_c = LG/|K_p|$, where $LG$ is the chosen loop gain.
-* **Disturbances (steps at t = 0):** feed flow +20 %; feed composition 50:50 → 60:40 heavy:light; extraction pH −0.05; scrub flow −20 %.
+* **Banded structure.** Ordering the unknowns as $[x_m, y_m, x_s, y_s]$ stage by stage keeps every non-zero within
+  6 places of the diagonal (**half-bandwidth 6**). A banded LU factorisation costs $O(N)$ work instead of $O(N^3)$.
+* **Stiffness.** Mass transfer acts in seconds and the plant settles in hours, a spread of about four orders of
+  magnitude. An explicit method would need tiny time steps. **Implicit Euler**,
+  $(M/\Delta t + A)\,u^{k+1} = (M/\Delta t)\,u^k + b$, is stable for any step, so the lab uses 2‑min steps.
+* **Steady state** is a single implicit step with a huge $\Delta t$, which reduces to $A\,u = b$. As
+  $\tau_{mt} \to 0$ it reproduces the ideal cascade of A8 (one of the tests on page 3).
 
-### Assumptions
-* pH is fixed in each stage (perfect acid/base control), and $D$ is constant (no loading or activity effects beyond the check).
-* Stages are ideal in the steady cascade. In the dynamic model, stage efficiency comes only from $\tau_{mt}$.
-* There is no reflux of product back to the cascade, no entrainment and no third phase.
-* $\tau_{mt}$ = 12 s, the volumes (8 L mixer, 40 L settler), feed concentration $c_F$ = 100 mmol/L and the controller limits
-  are **teaching estimates**, not plant data.
-* The Sm/Nd and Y/Sm separation factors and the Ce(IV) shift are illustrative.
+### B5 · Start-up  → *Lab 7*
+At $t = 0$ the plant is full of metal-free liquor and the feed is switched on. Metal spreads outward from the feed
+stage, the internal profiles build up (the profile snapshots in Lab 7 go from light to dark shades as time passes), and
+the products slowly reach specification.
+
+* **Masking.** Early on, the products carry almost no metal, so their purity is meaningless. A product's purity is
+  plotted only after it carries 5 % of its steady metal flow.
+* **Settling time:** the last moment either purity is more than **±1 point** from its steady value (the shaded bands).
+  The Pr|Nd default settles in about **23 h**, about 1.4 times the hold-up ÷ feed flow. The plant must accumulate an
+  internal metal inventory larger than one hold-up of feed before the profiles stop moving.
+
+### B6 · Process response and identification  → *Lab 8*
+Controller design starts from a model of how the **controlled variable** responds to the **manipulated variable**.
+Lab 8 runs a **step test**: from steady state, the solvent flow S jumps by a set percentage and the raffinate's heavy
+share is recorded.
+
+* **Steady-state gain** $K_p = \Delta y_\infty / \Delta S$, in percentage points per L/min. It is **negative**:
+  more solvent extracts more heavy element, so less reaches the raffinate. The controller uses $K_p$ from a
+  ±5 % steady-state perturbation, which is the average of the up and down step gains. Because the plant is nonlinear,
+  the gains for +5 % and −5 % steps differ.
+* **FOPDT model.** Many lags in series (stages, mixers, settlers) produce an S-shaped response, which is approximated by a
+  **first-order-plus-dead-time** model:
+  $$y(t) = y_0 + K_p\,\Delta S\,\big(1 - e^{-(t-\theta)/\tau}\big)\quad (t > \theta)$$
+* **Smith's two-point method** fits it from the times at which the response reaches 28.3 % and 63.2 % of its final
+  change: $\tau = 1.5\,(t_{63} - t_{28})$ and $\theta = t_{63} - \tau$. At the defaults the result is
+  $\tau \approx 7$ h and an apparent dead time $\theta \approx 14$ min. The plant is slow, but it starts to respond
+  quickly, which makes it easy to control.
+
+### B7 · Feedback control with a PI controller  → *Labs 8–9*
+* **Controlled variable (CV):** heavy-element share (%) in the raffinate, measured by an **on-line analyzer** (for
+  example XRF). Sampling and analysis add a **dead time**, the **Analyzer delay** slider.
+* **Manipulated variable (MV):** the solvent flow S. It acts on every extraction factor at once, and pumps change it
+  quickly. Other possible MVs are the scrub flow or the extraction acidity.
+* **Setpoint:** the nominal steady value of the CV (21.9 % for Pr|Nd).
+* **PI law** (reverse acting because $K_p < 0$):
+  $$S = S_0 + K_c\Big(e + \frac{1}{T_i}\int_0^t e\,dt\Big),\qquad e = y_{meas} - y_{sp}$$
+  The **proportional** term reacts to the current error. The **integral** term keeps adjusting until the error is zero,
+  which removes steady **offset**.
+* **Loop gain** $LG = K_c\,|K_p|$ is dimensionless, so $K_c = LG/|K_p|$. A higher LG reacts harder, but with dead
+  time too much gain causes overshoot and oscillation. A shorter **integral time $T_i$** removes the offset faster but
+  also destabilises.
+* **SIMC tuning rule** (Skogestad) for an FOPDT model, with closed-loop time constant $\tau_c$ set equal to the total
+  dead time $\theta + \theta_{analyzer}$:
+  $$LG = \frac{\tau}{\tau_c + \theta_{tot}},\qquad T_i = \min\big(\tau,\ 4(\tau_c + \theta_{tot})\big)$$
+  At the defaults this suggests LG ≈ 8.7 and $T_i$ ≈ 190 min, much more aggressive than the conservative default
+  of LG 2 and $T_i$ 120 min. Lab 8 shows the suggestion, and Lab 9 lets you try it.
+* **Actuator limits and anti-windup.** S may move only ±50 % (the **Solvent-flow limit** slider). When the output sits
+  on a limit, an integral term would keep growing ("windup") and cause a large overshoot later. **Conditional
+  integration** freezes the integral whenever the output is saturated and the error would push it further.
+
+### B8 · The four disturbances  → *Lab 9*
+Each is a step at $t = 0$ from steady state.
+
+| Disturbance | Physical effect | Open-loop effect on the CV |
+|---|---|---|
+| **Feed flow +20 %** | More metal and more aqueous flow in the extraction section, so S/L and the extraction factors fall | Heavy breaks through to the raffinate: 21.9 → 28.9 % |
+| **Feed composition 50:50 → 60:40 heavy:light** | More heavy element enters at the same flows | Heavy share in the raffinate rises (about 29.5 %) |
+| **Extraction pH −0.05** | $D$ falls by $10^{0.15} \approx 1.4$ in every extraction stage | The largest upset (about 37 %), showing why acidity control matters |
+| **Scrub flow −20 %** | Less wash liquor, so less metal returns from the organic | The raffinate gets *cleaner* (about 18 %) while the **extract** gets dirtier |
+
+### B9 · Judging control performance  → *Lab 9*
+* **Peak deviation:** the largest excursion of the CV from setpoint. For feed +20 %, the default PI controller
+  cuts it from 6.9 to about 1.8 points.
+* **IAE:** the integral of absolute error, $\int |y - y_{sp}|\,dt$ in point·hours. It measures both size and duration.
+* **Offset at the end:** about zero whenever integral action works and the MV is not stuck on a limit.
+* **Time on a limit:** if S saturates, the controller cannot reject the disturbance (try a small limit with the pH
+  disturbance).
+* **Extract purity (not controlled).** One MV can hold only one CV. After a +20 % feed step in open loop, the
+  raffinate fails (more heavy element escapes) while the extract actually gets slightly purer. The PI controller
+  protects the raffinate by adding solvent. The extra solvent also extracts more of the light element, so extract
+  purity falls from 78.8 % to about 73.6 %. Holding both products needs a second loop (for example on the scrub flow,
+  which pushes light element back out of the organic) or **feedforward** from a feed-flow measurement. Neither is
+  modelled here.
+
+### B10 · Assumptions in Part B
+* The pH is fixed in each stage, and $D$ is constant (linear model).
+* Mixers and settlers are each perfectly mixed. There is no plug flow, phase holdup dynamics or transfer in the
+  settlers, and the phase volumes stay at the nominal split.
+* $\tau_{mt}$ = 12 s, the 8 L mixer and 40 L settler, the analyzer (a pure dead time with no noise or sampling) and the
+  ±50 % MV limit are **teaching estimates**.
+* The process gain is found by steady-state perturbation and the FOPDT model by Smith's method. Both are approximations
+  of a nonlinear, high-order plant.
+* Implicit Euler with 2‑min steps is accurate for the slow dynamics but smooths anything faster than a few minutes.
 """
     )
     return
@@ -887,7 +1314,20 @@ def _(DISTURBANCES, mo):
     sl_LG = mo.ui.slider(0.25, 5.0, 0.25, value=2.0, label="Loop gain LG", show_value=True, debounce=True)
     sl_Ti = mo.ui.slider(10, 600, 10, value=120, label="Integral time Ti (min)", show_value=True, debounce=True)
     sl_delay = mo.ui.slider(0, 60, 2, value=10, label="Analyzer delay (min)", show_value=True, debounce=True)
-    return dd_dist, sl_F, sl_LG, sl_Ti, sl_Vm, sl_Vs, sl_delay, sl_tmt
+    sl_limit = mo.ui.slider(10, 100, 5, value=50, label="Solvent-flow limit (± % of nominal)", show_value=True, debounce=True)
+    sl_step = mo.ui.slider(-20, 20, 1, value=5, label="Step in S (% of nominal)", show_value=True, debounce=True)
+    return (
+        dd_dist,
+        sl_F,
+        sl_LG,
+        sl_Ti,
+        sl_Vm,
+        sl_Vs,
+        sl_delay,
+        sl_limit,
+        sl_step,
+        sl_tmt,
+    )
 
 
 @app.cell(hide_code=True)
@@ -895,8 +1335,11 @@ def _(PAGES, mo, nav):
     mo.stop(nav.value != PAGES[1])
     mo.md(
         "## 2 · Interactive lab\n"
-        "Six sections, from one equilibrium contact up to a controlled mixer-settler plant. "
-        "Every chart updates live. Equations are on page 1, and the code is on page 3."
+        "The lab has two halves of equal weight. **Part A, Separations** (sections 1–5) goes from one equilibrium "
+        "contact to a full extraction/scrub cascade. **Part B, Process dynamics and control** (sections 6–9) turns that "
+        "cascade into a mixer-settler plant and controls it. Every chart updates live. Each section has a matching "
+        "concept section on page 1, and the code is on page 3.\n\n"
+        "---\n## Part A · Separations"
     )
     return
 
@@ -1173,6 +1616,9 @@ def _(
         label_axes(_ax, _title + " (shaded = scrub)", "Stage (1 = raffinate end)", _yl)
     _axes[1].axhline(cas["Q"], color=INK2, lw=1, ls=":")
     _beta = separation_factor(_h, _l)
+    _efac = [{"Section": _sec, f"E {_l} (light)": round(float(sl_S.value * cas[_l]["D"][_i] / cas["L"][_i]), 3),
+              f"E {_h} (heavy)": round(float(sl_S.value * cas[_h]["D"][_i] / cas["L"][_i]), 3)}
+             for _sec, _i in (("Extraction", 0), ("Scrub", cas["N"] - 1))]
     _warn = (mo.callout(mo.md(f"**Validity check failed:** peak organic loading {cas['peak_loading']:.1f} mmol/L "
                               f"exceeds Q = C/6 = {cas['Q']:.1f} mmol/L. Constant D is not valid here."), kind="danger")
              if not cas["loading_ok"] else
@@ -1190,12 +1636,28 @@ def _(
             mo.stat(f"{fenske_nmin(_beta):.1f}", label=f"Fenske N_min (β={_beta:.3g})", bordered=True),
         ], widths="equal"),
         _warn,
+        mo.ui.table(_efac, selection=None, label="Extraction factors E = S·D/L (separation needs heavy > 1 > light)"),
         _fig,
     ])
     return
 
 
-# --------------------------------------------------- Section 6: dynamics & control
+# ============================================================================
+# PAGE 2, PART B: Process dynamics and control (sections 6-9)
+# ============================================================================
+@app.cell(hide_code=True)
+def _(PAGES, mo, nav):
+    mo.stop(nav.value != PAGES[1])
+    mo.md(
+        "---\n## Part B · Process dynamics and control\n"
+        "Sections 6–9 build the section 5 cascade as a plant of real mixer-settlers. They use the same pair, stages, "
+        "S and W (scaled by the feed flow F) and pH values. You can then watch the plant fill, find "
+        "its step response, tune a PI controller and reject disturbances. The concepts are in **Part B** of page 1."
+    )
+    return
+
+
+# --------------------------------------------------- Section 6: hydraulics and stage efficiency
 @app.cell(hide_code=True)
 def _(
     PAGES,
@@ -1203,7 +1665,6 @@ def _(
     make_plant,
     mo,
     nav,
-    simulate_startup,
     sl_F,
     sl_S,
     sl_Vm,
@@ -1218,26 +1679,12 @@ def _(
     sl_tmt,
 ):
     mo.stop(nav.value != PAGES[1])
-    # S and W from section 5 are per unit feed; scale them by F.
+    # S and W from section 5 are per unit feed; scale them by F (L/min).
     plant = make_plant(dd_pair.value, sl_next.value, sl_nscr.value, sl_S.value * sl_F.value,
                        sl_W.value * sl_F.value, sl_pHe.value, sl_pHs.value, sl_F.value,
                        float(sl_Vm.value), float(sl_Vs.value), sl_tmt.value / 60.0,
                        float(sl_cF.value), sl_fh.value)
-    startup = simulate_startup(plant)
-    return plant, startup
-
-
-@app.cell(hide_code=True)
-def _(dd_dist, plant, simulate_disturbance):
-    open_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=False)
-    return (open_loop,)
-
-
-@app.cell(hide_code=True)
-def _(dd_dist, plant, simulate_disturbance, sl_LG, sl_Ti, sl_delay):
-    closed_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=True, LG=sl_LG.value,
-                                       Ti=float(sl_Ti.value), delay=float(sl_delay.value))
-    return (closed_loop,)
+    return (plant,)
 
 
 @app.cell(hide_code=True)
@@ -1247,92 +1694,251 @@ def _(
     COLORS,
     INK,
     INK2,
-    closed_loop,
-    dd_dist,
+    efficiency_sweep,
     label_axes,
     mo,
     new_figure,
     np,
-    open_loop,
     plant,
     sl_F,
-    sl_LG,
-    sl_Ti,
     sl_Vm,
     sl_Vs,
-    sl_delay,
     sl_tmt,
-    startup,
 ):
     _N = plant["N"]
     _st = np.arange(1, _N + 1)
-    # residence times per stage (grouped bars, 2 px surface gap)
     _f1, (_a1,) = new_figure(1, 9.5, 3.0)
-    _a1.bar(_st - 0.2, plant["tau_mix"], width=0.38, color=ACCENT1, edgecolor="white", lw=1, label="τ_mix")
-    _a1.bar(_st + 0.2, plant["tau_set"], width=0.38, color=ACCENT2, edgecolor="white", lw=1, label="τ_set")
+    _a1.bar(_st - 0.2, plant["tau_mix"], width=0.38, color=ACCENT1, edgecolor="white", lw=1, label="τ_mix (mixer)")
+    _a1.bar(_st + 0.2, plant["tau_set"], width=0.38, color=ACCENT2, edgecolor="white", lw=1, label="τ_set (settler)")
     _a1.axvline(plant["n_ext"] + 0.5, color=INK2, lw=1, ls="--")
     _a1.legend(frameon=False, fontsize=8, loc="upper left")
-    label_axes(_a1, "Residence time per stage (dashed line = feed/scrub boundary)", "Stage", "min")
-    # start-up
+    label_axes(_a1, "Residence time per stage, τ = V/(S + L_n) (dashed = feed/scrub boundary)", "Stage", "min")
+    # stage efficiency: steady purities against the mass-transfer time
+    _grid_s = np.unique(np.r_[np.linspace(1, 120, 40), sl_tmt.value])
+    _sw = efficiency_sweep(plant, _grid_s / 60.0)
+    _ideal = efficiency_sweep(plant, [1e-6])[0]
+    _now = efficiency_sweep(plant, [sl_tmt.value / 60.0])[0]
     _f2, (_a2,) = new_figure(1, 9.5, 3.2)
+    for _j, _el, _name, _dy in ((0, plant["light"], "raffinate", -12), (1, plant["heavy"], "extract", 6)):
+        _a2.plot(_grid_s, _sw[:, _j], color=COLORS[_el], lw=2)
+        _a2.axhline(_ideal[_j], color=COLORS[_el], lw=1, ls=":")
+        _a2.annotate(f"{_name} ({_el})", (_grid_s[-1], _sw[-1, _j]), xytext=(-4, _dy),
+                     textcoords="offset points", ha="right", fontsize=8, color=INK)
+    _a2.axvline(sl_tmt.value, color=INK2, lw=1, ls="--")
+    _a2.annotate(f"τ_mt = {sl_tmt.value} s", (sl_tmt.value, 1.0), xycoords=("data", "axes fraction"),
+                 xytext=(4, -12), textcoords="offset points", fontsize=8, color=INK2)
+    label_axes(_a2, "Steady purity vs mass-transfer time (dotted = ideal stages)", "τ_mt (s)", "Purity (%)")
+    mo.vstack([
+        mo.md("### 6 · Mixer-settler hydraulics and stage efficiency"),
+        mo.hstack([sl_F, sl_Vm, sl_Vs, sl_tmt], justify="start", gap=1.5, wrap=True),
+        mo.hstack([
+            mo.stat(f"{plant['tau_mix'][0]:.2f} / {plant['tau_set'][0]:.2f} min", label="Extraction τ_mix / τ_set", bordered=True),
+            mo.stat(f"{plant['tau_mix'][-1]:.2f} / {plant['tau_set'][-1]:.2f} min", label="Scrub τ_mix / τ_set", bordered=True),
+            mo.stat(f"{plant['eta'][0]:.3f} / {plant['eta'][-1]:.3f}", label="η extraction / scrub", bordered=True),
+            mo.stat(f"{plant['holdup']:.0f} L", label="Hold-up", bordered=True),
+            mo.stat(f"{plant['holdup'] / plant['F'] / 60:.1f} h", label="Hold-up ÷ feed flow", bordered=True),
+        ], widths="equal"),
+        _f1,
+        mo.md(f"With τ_mt = {sl_tmt.value} s the plant reaches **{_now[0]:.2f} % / {_now[1]:.2f} %** "
+              f"(raffinate / extract purity). Ideal stages would give **{_ideal[0]:.2f} % / {_ideal[1]:.2f} %**."),
+        _f2,
+    ])
+    return
+
+
+# --------------------------------------------------- Section 7: start-up
+@app.cell(hide_code=True)
+def _(plant, simulate_startup):
+    startup = simulate_startup(plant)
+    return (startup,)
+
+
+@app.cell(hide_code=True)
+def _(COLORS, INK, INK2, label_axes, mo, new_figure, np, plant, startup):
     _th = startup["t"] / 60
+    _f1, (_a1,) = new_figure(1, 9.5, 3.2)
     for _v, _ss, _el, _name, _dy in ((startup["pr"], startup["pr_ss"], plant["light"], "raffinate", -14),
                                      (startup["pe"], startup["pe_ss"], plant["heavy"], "extract", 8)):
-        _a2.plot(_th, _v, color=COLORS[_el], lw=2)
-        _a2.axhspan(_ss - 1, _ss + 1, color=COLORS[_el], alpha=0.12, lw=0)
+        _a1.plot(_th, _v, color=COLORS[_el], lw=2)
+        _a1.axhspan(_ss - 1, _ss + 1, color=COLORS[_el], alpha=0.12, lw=0)
         _ok = np.isfinite(_v)
-        _a2.annotate(f"{_name} ({_el})", (_th[-1], _v[_ok][-1] if _ok.any() else _ss), xytext=(-4, _dy),
+        _a1.annotate(f"{_name} ({_el})", (_th[-1], _v[_ok][-1] if _ok.any() else _ss), xytext=(-4, _dy),
                      textcoords="offset points", ha="right", fontsize=8, color=INK)
     if np.isfinite(startup["t_settle"]):
-        _a2.axvline(startup["t_settle"] / 60, color=INK2, lw=1, ls="--")
-        _a2.annotate(f"settled {startup['t_settle'] / 60:.1f} h", (startup["t_settle"] / 60, 1.0),
+        _a1.axvline(startup["t_settle"] / 60, color=INK2, lw=1, ls="--")
+        _a1.annotate(f"settled {startup['t_settle'] / 60:.1f} h", (startup["t_settle"] / 60, 1.0),
                      xycoords=("data", "axes fraction"), xytext=(4, -12),
                      textcoords="offset points", fontsize=8, color=INK2)
     _vals = np.concatenate([startup["pr"][np.isfinite(startup["pr"])], startup["pe"][np.isfinite(startup["pe"])]])
-    _a2.set_ylim(max(0.0, (_vals.min() if _vals.size else 0.0) - 5), 100)
-    label_axes(_a2, "Start-up purities (masked below 5 % of steady flow; bands = ±1 point)", "Time (h)", "Purity (%)")
-    # disturbance response: CV and MV on separate axes (no dual axis)
-    _f3, (_a3, _a4) = new_figure(2, 9.5, 3.4)
-    _tt = open_loop["t"] / 60
-    _a3.plot(_tt, open_loop["cv"], color=INK2, lw=2)
-    _a3.plot(_tt, closed_loop["cv"], color=ACCENT1, lw=2)
-    _a3.axhline(open_loop["sp"], color=INK2, lw=1, ls=":")
-    _a3.annotate("open loop", (_tt[-1], open_loop["cv"][-1]), xytext=(-4, 6), textcoords="offset points",
-                 ha="right", fontsize=8, color=INK)
-    _a3.annotate("PI", (_tt[-1], closed_loop["cv"][-1]), xytext=(-4, -12), textcoords="offset points",
-                 ha="right", fontsize=8, color=INK)
-    label_axes(_a3, "Heavy-element share in raffinate (CV)", "Time after step (h)", "%")
-    _a4.plot(_tt, open_loop["S"], color=INK2, lw=2)
-    _a4.plot(_tt, closed_loop["S"], color=ACCENT1, lw=2)
-    _a4.axhspan(0.5 * plant["S"], 1.5 * plant["S"], color="#ecebe7", zorder=0)
-    label_axes(_a4, "Solvent flow S (MV; shaded = ±50 % limits)", "Time after step (h)", "L/min")
-    _ext, _scr = 0, _N - 1
+    _a1.set_ylim(max(0.0, (_vals.min() if _vals.size else 0.0) - 5), 100)
+    label_axes(_a1, "Start-up purities (hidden below 5 % of steady flow; bands = ±1 point)", "Time (h)", "Purity (%)")
+    # profile snapshots: one hue per element, light -> dark as time advances
+    _st = np.arange(1, plant["N"] + 1)
+    _f2, _axs = new_figure(2, 9.5, 3.3)
+    _times = sorted(startup["snaps"])
+    for _ax, _el, _e, _off, _what in ((_axs[0], plant["light"], 0, 2, "aqueous x"),
+                                      (_axs[1], plant["heavy"], 1, 3, "organic y")):
+        for _i, _h in enumerate(_times):
+            _ax.plot(_st, startup["snaps"][_h][_e, _off::4], color=COLORS[_el], lw=2,
+                     alpha=0.25 + 0.6 * _i / max(1, len(_times) - 1), label=f"{_h} h")
+        _ax.plot(_st, startup["u_ss"][_e, _off::4], color=INK, lw=1.5, ls="--", label="steady")
+        _ax.axvline(plant["n_ext"], color=INK2, lw=1, ls=":")
+        _ax.legend(frameon=False, fontsize=7, loc="best")
+        label_axes(_ax, f"{_el} settler {_what} profile filling up", "Stage (dotted = feed)", "mmol/L")
     mo.vstack([
-        mo.md("### 6 · Mixer-settler dynamics and PI control\n"
-              "Uses the pair, stages, S, W (× F) and pH values from section 5."),
-        mo.hstack([sl_F, sl_Vm, sl_Vs, sl_tmt], justify="start", gap=1.5, wrap=True),
-        mo.hstack([
-            mo.stat(f"{plant['tau_mix'][_ext]:.2f} / {plant['tau_set'][_ext]:.2f} min", label="Extraction τ_mix / τ_set", bordered=True),
-            mo.stat(f"{plant['tau_mix'][_scr]:.2f} / {plant['tau_set'][_scr]:.2f} min", label="Scrub τ_mix / τ_set", bordered=True),
-            mo.stat(f"{plant['eta'][_ext]:.3f} / {plant['eta'][_scr]:.3f}", label="η extraction / scrub", bordered=True),
-            mo.stat(f"{plant['holdup']:.0f} L", label="Hold-up", bordered=True),
-        ], widths="equal"),
-        _f1,
+        mo.md("### 7 · Start-up dynamics\nThe plant starts full of metal-free liquor, and the feed is switched on at t = 0."),
         mo.hstack([
             mo.stat(f"{startup['pr_ss']:.2f} %", label=f"Steady raffinate purity ({plant['light']})", bordered=True),
             mo.stat(f"{startup['pe_ss']:.2f} %", label=f"Steady extract purity ({plant['heavy']})", bordered=True),
             mo.stat(f"{startup['t_settle'] / 60:.1f} h" if np.isfinite(startup["t_settle"]) else "> horizon",
                     label="Settling time (±1 point)", bordered=True),
+            mo.stat(f"{startup['t_settle'] / 60 / (plant['holdup'] / plant['F'] / 60):.2f}"
+                    if np.isfinite(startup["t_settle"]) else "n/a",
+                    label="Settling time ÷ (hold-up ÷ F)", bordered=True),
         ], widths="equal"),
+        _f1,
         _f2,
-        mo.hstack([dd_dist, sl_LG, sl_Ti, sl_delay], justify="start", gap=1.5, wrap=True),
+    ])
+    return
+
+
+# --------------------------------------------------- Section 8: step test and tuning
+@app.cell(hide_code=True)
+def _(fopdt_smith, plant, simc_tuning, sl_delay, sl_step, step_test):
+    if sl_step.value == 0:
+        stp, fit, simc = None, None, None
+    else:
+        stp = step_test(plant, sl_step.value / 100.0)
+        fit = fopdt_smith(stp["t"], stp["y"], stp["y0"], stp["y_inf"])
+        simc = simc_tuning(fit["tau"], fit["theta"] + float(sl_delay.value))
+    return fit, simc, stp
+
+
+@app.cell(hide_code=True)
+def _(
+    ACCENT1,
+    INK,
+    INK2,
+    fit,
+    fopdt_response,
+    label_axes,
+    mo,
+    new_figure,
+    np,
+    plant,
+    process_gain,
+    simc,
+    sl_delay,
+    sl_step,
+    stp,
+):
+    _head = mo.md("### 8 · Step test, process model and PI tuning")
+    _ctrl = mo.hstack([sl_step, sl_delay], justify="start", gap=1.5, wrap=True)
+    if stp is None:
+        _out = mo.vstack([_head, _ctrl, mo.callout(mo.md("Choose a non-zero step size."), kind="warn")])
+    else:
+        _K = (stp["y_inf"] - stp["y0"]) / stp["dS"]
+        _th = stp["t"] / 60
+        _f, (_a,) = new_figure(1, 9.5, 3.4)
+        _a.plot(_th, stp["y"], color=ACCENT1, lw=2)
+        _a.plot(_th, fopdt_response(stp["t"], stp["y0"], _K, stp["dS"], fit["tau"], fit["theta"]),
+                color=INK2, lw=1.5, ls="--")
+        for _lvl, _tx in ((0.283, fit["t28"]), (0.632, fit["t63"])):
+            if np.isfinite(_tx):
+                _yy = stp["y0"] + _lvl * (stp["y_inf"] - stp["y0"])
+                _a.plot([_tx / 60], [_yy], "o", ms=7, color=ACCENT1, mec="white", mew=1.5)
+                _a.annotate(f"{_lvl * 100:.1f} % at {_tx / 60:.2f} h", (_tx / 60, _yy), xytext=(6, 4),
+                            textcoords="offset points", fontsize=8, color=INK)
+        _a.axhline(stp["y_inf"], color=INK2, lw=1, ls=":")
+        _a.annotate("simulated plant", (_th[-1], stp["y"][-1]), xytext=(-4, 6 if _K > 0 else -12),
+                    textcoords="offset points", ha="right", fontsize=8, color=INK)
+        label_axes(_a, f"Open-loop response to a {sl_step.value:+d} % step in S (dashed = fitted FOPDT model)",
+                   "Time after step (h)", "Heavy share in raffinate (%)")
+        _out = mo.vstack([
+            _head,
+            _ctrl,
+            mo.hstack([
+                mo.stat(f"{_K:.2f}", label="Kp from this step (points per L/min)", bordered=True),
+                mo.stat(f"{process_gain(plant):.2f}", label="Kp from ±5 % steady states", bordered=True),
+                mo.stat(f"{fit['tau'] / 60:.2f} h", label="Time constant τ", bordered=True),
+                mo.stat(f"{fit['theta']:.1f} min", label="Apparent dead time θ", bordered=True),
+            ], widths="equal"),
+            _f,
+            mo.callout(mo.md(
+                f"**SIMC suggestion** (with τ_c = θ + analyzer delay = {fit['theta'] + sl_delay.value:.1f} min): "
+                f"loop gain **LG ≈ {simc['LG']:.1f}**, **Ti ≈ {simc['Ti']:.0f} min**. "
+                "Try these values in section 9 and compare them with the default LG 2, Ti 120 min."), kind="info"),
+        ])
+    _out
+    return
+
+
+# --------------------------------------------------- Section 9: disturbances and PI control
+@app.cell(hide_code=True)
+def _(dd_dist, plant, simulate_disturbance):
+    open_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=False)
+    return (open_loop,)
+
+
+@app.cell(hide_code=True)
+def _(dd_dist, plant, simulate_disturbance, sl_LG, sl_Ti, sl_delay, sl_limit):
+    closed_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=True, LG=sl_LG.value,
+                                       Ti=float(sl_Ti.value), delay=float(sl_delay.value),
+                                       limit=sl_limit.value / 100.0)
+    return (closed_loop,)
+
+
+@app.cell(hide_code=True)
+def _(
+    ACCENT1,
+    INK,
+    INK2,
+    closed_loop,
+    dd_dist,
+    label_axes,
+    mo,
+    new_figure,
+    open_loop,
+    plant,
+    sl_LG,
+    sl_Ti,
+    sl_delay,
+    sl_limit,
+):
+    _tt = open_loop["t"] / 60
+    _f, (_a1, _a2, _a3) = new_figure(3, 10.5, 3.3)
+    for _ax, _key, _title, _yl in ((_a1, "cv", "CV: heavy share in raffinate", "%"),
+                                   (_a2, "ext", "Extract purity (not controlled)", "%"),
+                                   (_a3, "S", "MV: solvent flow S", "L/min")):
+        _ax.plot(_tt, open_loop[_key], color=INK2, lw=2)
+        _ax.plot(_tt, closed_loop[_key], color=ACCENT1, lw=2)
+        _ol_up = open_loop[_key][-1] >= closed_loop[_key][-1]   # put the higher curve's label above
+        _ax.annotate("open loop", (_tt[-1], open_loop[_key][-1]), xytext=(-4, 6 if _ol_up else -12),
+                     textcoords="offset points", ha="right", fontsize=8, color=INK)
+        _ax.annotate("PI", (_tt[-1], closed_loop[_key][-1]), xytext=(-4, -12 if _ol_up else 6),
+                     textcoords="offset points", ha="right", fontsize=8, color=INK)
+        label_axes(_ax, _title, "Time after step (h)", _yl)
+    _a1.axhline(open_loop["sp"], color=INK2, lw=1, ls=":")
+    _lim = sl_limit.value / 100.0
+    _a3.axhspan((1 - _lim) * plant["S"], (1 + _lim) * plant["S"], color="#ecebe7", zorder=0)
+    mo.vstack([
+        mo.md("### 9 · Disturbance rejection with PI control\n"
+              "The grey band on the S chart is the allowed range of the solvent flow."),
+        mo.hstack([dd_dist, sl_LG, sl_Ti], justify="start", gap=1.5, wrap=True),
+        mo.hstack([sl_delay, sl_limit], justify="start", gap=1.5, wrap=True),
         mo.hstack([
             mo.stat(f"{open_loop['sp']:.1f} → {open_loop['final']:.1f} %", label="CV open loop (start → end)", bordered=True),
-            mo.stat(f"{open_loop['peak']:.2f}", label="Open-loop peak deviation (points)", bordered=True),
-            mo.stat(f"{closed_loop['peak']:.2f}", label="PI peak deviation (points)", bordered=True),
-            mo.stat(f"{open_loop['Kp']:.2f} / {closed_loop['Kc']:.3f}", label="Kp (pts per L/min) / Kc", bordered=True),
+            mo.stat(f"{open_loop['peak']:.2f} / {closed_loop['peak']:.2f}", label="Peak deviation, open / PI (points)", bordered=True),
+            mo.stat(f"{open_loop['iae']:.1f} / {closed_loop['iae']:.1f}", label="IAE, open / PI (point·h)", bordered=True),
+            mo.stat(f"{closed_loop['final'] - closed_loop['sp']:+.2f}", label="PI offset at end (points)", bordered=True),
         ], widths="equal"),
-        _f3,
+        mo.hstack([
+            mo.stat(f"{open_loop['Kp']:.2f}", label="Kp (points per L/min)", bordered=True),
+            mo.stat(f"{closed_loop['Kc']:.3f}", label="Kc = LG/|Kp| (L/min per point)", bordered=True),
+            mo.stat(f"{100 * closed_loop['sat_frac']:.0f} %", label="Time with S on a limit", bordered=True),
+            mo.stat(f"{open_loop['ext'][0]:.1f} → {closed_loop['ext'][-1]:.1f} %", label="Extract purity under PI", bordered=True),
+        ], widths="equal"),
+        _f,
     ])
     return
 
@@ -1374,8 +1980,8 @@ def _(
         ("Kremser and McCabe–Thiele", mccabe_thiele),
         ("Steady extraction/scrub cascade (tridiagonal)", cascade_steady),
         ("Banded LU solver (half-bandwidth 6)", band_lu),
-        ("Mixer-settler dynamics (implicit Euler)", assemble),
-        ("PI control and disturbances", simulate_disturbance),
+        ("Mixer-settler dynamics, efficiency sweep and start-up (implicit Euler)", assemble),
+        ("Step test, FOPDT fit, SIMC tuning, PI control and disturbances", simulate_disturbance),
         ("Tests", run_tests),
         ("Plotting helpers", new_figure),
     ]
@@ -1460,6 +2066,9 @@ fetching was blocked by the session's network policy, so **no reference was read
 | 9 | *Solvent extraction and separation of Ce(III) and Sm(III) from mixed rare earth solutions using PC88A*: [onemine.org](https://onemine.org/documents/solvent-extraction-and-separation-of-cerium-iii-and-samarium-iii-from-mixed-rare-earth-solutions-using-pc88a) | Ce/Sm selectivity is best in H₂SO₄ at pH 2 (qualitative) | Excerpt |
 | 10 | Fenske, Kremser and McCabe–Thiele relations, as in standard separation-process textbooks (e.g. Seader, Henley & Roper, *Separation Process Principles*, Wiley) | Staging equations on page 1 | Not consulted in this session (from the model's background knowledge) |
 | 11 | marimo documentation: [docs.marimo.io](https://docs.marimo.io) | Notebook API, WebAssembly export | Not consulted in this session (from the model's background knowledge) |
+| 12 | Skogestad S., *Simple analytic rules for model reduction and PID controller tuning*, Journal of Process Control 13 (2003) 291–309: [doi:10.1016/S0959-1524(02)00062-8](https://doi.org/10.1016/S0959-1524(02)00062-8) | SIMC PI tuning rule (B7, Lab 8) | Not consulted in this session (from the model's background knowledge) |
+| 13 | Smith C.L., *Digital Computer Process Control*, Intext (1972); the two-point (28.3 % / 63.2 %) FOPDT fit as presented in standard process-control textbooks (e.g. Seborg, Edgar, Mellichamp & Doyle, *Process Dynamics and Control*, Wiley) | Step-test identification (B6, Lab 8) | Not consulted in this session (from the model's background knowledge) |
+| 14 | General background on liquid–liquid extraction, extractant families, saponification, mixer-settlers and the lanthanide contraction (A1–A2, B2): standard hydrometallurgy texts such as Gupta C.K. & Krishnamurthy N., *Extractive Metallurgy of Rare Earths*, CRC Press, and ref. 2 | Concept text on page 1 | Not consulted in this session (from the model's background knowledge; ref. 2 seen as excerpt only) |
 
 **Flags on parameter values.** No idx value was changed. Ce/La 4, Pr/Ce 2 and Nd/Pr 1.5 are kept as given (attributed to
 ref. 1, and Nd/Pr is consistent with refs. 4 and 5). **Sm/Nd = 7 and Y/Sm = 40 remain teaching estimates.** No source in
@@ -1477,6 +2086,15 @@ conditions. Published β for Ce/La range from about 4 to above 50 depending on t
 * **Process gain:** central difference over S ± 5 %. Kc = LG/|Kp|, reverse acting.
 * **Phase volumes** in the dynamic model are fixed at the nominal split, even when the flows change.
 * **Ce(IV) switch:** applies to sections 1 and 2 only.
+* **Project balance:** following the author's request, the notebook is split 50/50 into Part A (Separations, lab
+  sections 1–5) and Part B (Process dynamics and control, lab sections 6–9). Page 1 has a matching concept section for
+  every lab section.
+* **Extra control tools beyond the original specification:** the stage-efficiency sweep (Lab 6), start-up profile
+  snapshots (Lab 7), the open-loop step test with Smith's FOPDT fit and SIMC suggestion (Lab 8), an adjustable
+  solvent-flow limit, and IAE, extract purity and time-on-limit tracking (Lab 9). The reference controller (Kc = LG/|Kp| from ±5 %
+  steady states) is unchanged.
+* **SIMC closed-loop time constant:** τ_c is set to the total dead time (process θ + analyzer delay), the usual "tight
+  control" choice.
 * **Test tolerances:** set to the number of decimals quoted in the specification (for example ±0.0005 for pH50 and ±0.1 point for purities).
 """
     )
