@@ -457,11 +457,12 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
             rows.append((100 * r[0] / r.sum(), 100 * e[1] / e.sum()))
         return np.array(rows)
 
-    def simulate_startup(plant, t_end=None, nsteps=1440, snap_hours=(2, 6, 12, 24)):
+    def simulate_startup(plant, t_end=None, nsteps=1440, snap_hours=(2, 6, 12, 24), frame_every=15):
         """Start from metal-free phases; feed switched on at t = 0.
         Purities are masked until each product carries 5 % of its steady flow.
         Settling time: last time either purity is outside +/-1 point of steady.
-        Stage profiles are stored at the times in `snap_hours`."""
+        Stage profiles are stored at the times in `snap_hours`, and the full state
+        every `frame_every` steps (for the P&ID animation)."""
         if t_end is None:
             t_end = float(np.clip(3.0 * plant["holdup"] / plant["F"], 48 * 60.0, 240 * 60.0))
         dt = t_end / nsteps
@@ -478,8 +479,12 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
         snap_steps = {int(round(h * 60 / dt)): h for h in snap_hours if h * 60 <= t_end}
         snaps = {}
         u = np.zeros_like(b)
+        frames, frame_k = [u.copy()], [0]
         for k in range(1, nsteps + 1):
             u = band_solve(lu, b + (m / dt) * u)
+            if k % frame_every == 0:
+                frames.append(u.copy())
+                frame_k.append(k)
             if k in snap_steps:
                 snaps[snap_steps[k]] = u.copy()
             r, e = product_flows(u, L[0], S)
@@ -496,7 +501,7 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
         else:
             t_settle = float(t[idx[-1] + 1])
         return dict(t=t, pr=pr, pe=pe, pr_ss=pr_ss, pe_ss=pe_ss, t_settle=t_settle,
-                    u_ss=u_ss, snaps=snaps)
+                    u_ss=u_ss, snaps=snaps, frames=np.array(frames), frame_k=np.array(frame_k))
 
     return (
         assemble,
@@ -606,7 +611,7 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
     CONTROL_MODES = ["PI", "P only", "PI + feedforward ratio (S/F)"]
 
     def simulate_disturbance(plant, name, closed_loop, LG=2.0, Ti=120.0, delay=10.0,
-                             t_end=None, nsteps=None, limit=0.5, mode="PI"):
+                             t_end=None, nsteps=None, limit=0.5, mode="PI", frame_every=15):
         """Step disturbance at t = 0 from the nominal steady state.
 
         mode = "PI": feedback PI on the delayed analyzer signal.
@@ -642,6 +647,7 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         # feedforward: the feed flow is measured without delay; S/F held at its nominal ratio
         S_base = S0 * kw.get("F", plant["F"]) / plant["F"] if mode.startswith("PI +") else S0
         cached_S, lu = None, None
+        frames, frame_k = [u.copy()], [0]           # full states for the P&ID animation
         for k in range(1, nsteps + 1):
             if S != cached_S:                       # refactor only when S moves
                 ab, b, m, L, _ = assemble(plant, S=S, **kw)
@@ -649,6 +655,9 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
                 A[:, :, KL] += m / dt
                 lu, cached_S = band_lu(A), S
             u = band_solve(lu, b + (m / dt) * u)
+            if k % frame_every == 0:
+                frames.append(u.copy())
+                frame_k.append(k)
             cv[k] = heavy_share_raffinate(u, L[0])
             s_hist[k] = S
             e_flow = S * u[:, -1]
@@ -668,7 +677,9 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
                     final=float(cv[-1]),
                     iae=float(np.sum(0.5 * (dev[1:] + dev[:-1])) * dt / 60.0),  # point-hours
                     ise=float(np.sum(0.5 * (dev[1:] ** 2 + dev[:-1] ** 2)) * dt / 60.0),
-                    sat_frac=float(np.mean(on_limit)))
+                    sat_frac=float(np.mean(on_limit)), frames=np.array(frames),
+                    frame_k=np.array(frame_k), nd=nd, dt=dt, F_run=kw.get("F", plant["F"]),
+                    W_run=kw.get("W", plant["W"]), mode=mode, closed_loop=closed_loop)
 
     return (
         CONTROL_MODES,
@@ -782,9 +793,12 @@ def _(
     separation_factor,
     simc_tuning,
     simulate_disturbance,
+    pid_svg,
     simulate_startup,
     stability_margins,
+    stage_trend,
     step_test,
+    steady_state,
     tuning_rules,
     ultimate_point,
 ):
@@ -914,6 +928,21 @@ def _(
         tail = at_ku["cv"][at_ku["t"] > at_ku["t"][-1] - 360.0]
         check("plant P-only at the model's LG_u still settles (late swing, points)", 0.0, float(np.ptp(tail)), 0.01)
 
+        # P&ID: one stage symbol per stage for any configuration; frames stored for the animation
+        cols = {el: "#000000" for el in ELEMENTS}
+        flows0 = dict(S=plant["S"], W=plant["W"], F=plant["F"])
+        ctrl0 = dict(mode="AUTO", pv=21.9, meas=21.9, sp=21.9, delay=10.0)
+        svg20 = pid_svg(plant, st["u_ss"], cols, 150.0, 40.0, flows0, ctrl0, "test")
+        check("P&ID draws one stage per stage (Pr|Nd, 10 + 10)", 20.0, float(svg20.count('class="stage"')), 0.0)
+        small = make_plant("Sm|Y", **PAIR_DEFAULTS["Sm|Y"])
+        svg6 = pid_svg(small, steady_state(small), cols, 150.0, 40.0, flows0, ctrl0, "test")
+        check("P&ID draws one stage per stage (Sm|Y, 3 + 3)", 6.0, float(svg6.count('class="stage"')), 0.0)
+        check("start-up frames: last stored frame is the final time step", 1440.0, float(st["frame_k"][-1]), 0.0)
+        check("start-up frames: first frame is the metal-free plant", 0.0, float(np.abs(st["frames"][0]).max()), 0.0)
+        tr = stage_trend(st["frames"][4], st["frames"][3], 0.5)
+        check("stage trend: every stage is filling 1.5–2 h into start-up (count of ▲)", 20.0,
+              float(np.sum(tr == 1)), 0.0)
+
         # actuator limits and anti-windup: a +/-20 % limit forces saturation
         hard = simulate_disturbance(plant, "Extraction pH −0.05", True, LG=5.0, Ti=30.0,
                                     delay=10.0, limit=0.2)
@@ -924,6 +953,199 @@ def _(
         return results
 
     return (run_tests,)
+
+
+@app.cell
+def _(np):
+    # --------------------------------------------------------------- P&ID drawing
+    # Builds an SVG piping & instrumentation diagram of the cascade: one
+    # mixer-settler box per stage (organic layer on top, aqueous below) with bars
+    # for the light and heavy element, the process streams, and ISA-style
+    # instrument bubbles for every control loop. Hover a stage for exact values.
+    from html import escape as _esc
+
+    def stage_trend(u_now, u_prev, dt_h, threshold=0.02):
+        """+1 / -1 / 0 per stage: total metal held in the stage's settler rising,
+        falling, or steady (relative change above `threshold` per hour)."""
+        if u_prev is None or dt_h <= 0:
+            return np.zeros(u_now.shape[1] // 4, int)
+        tot_now = (u_now[:, 2::4] + u_now[:, 3::4]).sum(axis=0)
+        tot_prev = (u_prev[:, 2::4] + u_prev[:, 3::4]).sum(axis=0)
+        rate = (tot_now - tot_prev) / dt_h / np.maximum(np.maximum(tot_now, tot_prev), 1e-9)
+        return np.where(rate > threshold, 1, np.where(rate < -threshold, -1, 0))
+
+    def _bubble(x, y, tag, sub="", active=True, r=19, sub_at=None, anchor="middle"):
+        """ISA instrument bubble; the horizontal line means 'control-room (DCS) mounted'.
+        `sub` is an optional reading, drawn below the bubble or at `sub_at` = (x, y)."""
+        sx, sy = sub_at if sub_at else (x, y + r + 12)
+        col = "#0b0b0b" if active else "#b5b3ad"
+        a, b_ = (tag.split("-") + [""])[:2]
+        return (f'<g><circle cx="{x}" cy="{y}" r="{r}" fill="#ffffff" stroke="{col}" stroke-width="1.5"/>'
+                f'<line x1="{x - r}" y1="{y}" x2="{x + r}" y2="{y}" stroke="{col}" stroke-width="1"/>'
+                f'<text x="{x}" y="{y - 5}" font-size="10" text-anchor="middle" fill="{col}" font-weight="600">{_esc(a)}</text>'
+                f'<text x="{x}" y="{y + 12}" font-size="9" text-anchor="middle" fill="{col}">{_esc(b_)}</text>'
+                + (f'<text x="{sx}" y="{sy}" font-size="9" text-anchor="{anchor}" fill="#52514e">{_esc(sub)}</text>' if sub else "")
+                + "</g>")
+
+    def _valve(x, y, active=True):
+        """Control-valve bow-tie on a horizontal line."""
+        col = "#0b0b0b" if active else "#b5b3ad"
+        return (f'<path d="M{x - 7},{y - 6} L{x + 7},{y + 6} L{x + 7},{y - 6} L{x - 7},{y + 6} Z" '
+                f'fill="#ffffff" stroke="{col}" stroke-width="1.3"/>')
+
+    def _signal(points, active=True):
+        """Dashed instrument signal line."""
+        col = "#52514e" if active else "#cfcdc6"
+        pts = " ".join(f"{x},{y}" for x, y in points)
+        return f'<polyline points="{pts}" fill="none" stroke="{col}" stroke-width="1.2" stroke-dasharray="5,3"/>'
+
+    def pid_svg(plant, u, colors, scale_aq, scale_org, flows, ctrl, time_label="", trend=None):
+        """Return the P&ID as an SVG string.
+
+        plant  : dict from make_plant (N, n_ext, light, heavy, pH values)
+        u      : (2, 4N) state [xm, ym, xs, ys per stage] for light (0) and heavy (1)
+        scale_*: concentration (mmol/L) that fills a layer's full bar height
+        flows  : dict S, W, F (actual flows at this instant, L/min)
+        ctrl   : dict mode ('MAN', 'AUTO', 'AUTO+FF'), pv, meas, sp, delay (min)
+        trend  : optional +1/-1/0 per stage from stage_trend()"""
+        N, f = plant["N"], plant["n_ext"]
+        light, heavy = plant["light"], plant["heavy"]
+        W_svg, H_svg = 1100, 560
+        x0, x1 = 190, W_svg - 190                    # stage area
+        pitch = (x1 - x0) / N
+        bw = pitch * 0.78                            # box width
+        top, mid, bot = 200, 285, 370                # organic layer top..mid, aqueous mid..bot
+        yo, ya = (top + mid) / 2, (mid + bot) / 2    # organic / aqueous stream levels
+        cx = lambda n: x0 + (n - 0.5) * pitch        # centre of stage n (1-based)
+        out = [f'<svg viewBox="0 0 {W_svg} {H_svg}" width="100%" xmlns="http://www.w3.org/2000/svg" '
+               f'font-family="Inter, Helvetica, Arial, sans-serif" role="img" '
+               f'aria-label="P&amp;ID of a {N}-stage extraction/scrub cascade">',
+               f'<rect x="0" y="0" width="{W_svg}" height="{H_svg}" fill="#fcfcfb"/>',
+               '<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
+               'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0b0b0b"/></marker></defs>']
+        mode = ctrl.get("mode", "MAN")
+        auto, ff = mode != "MAN", mode == "AUTO+FF"
+
+        # ---- section brackets and pH controllers
+        for lo_n, hi_n, name, ph, tag in ((1, f, "Extraction", plant["pH_ext"], "pHIC-201"),
+                                          (f + 1, N, "Scrub", plant["pH_scr"], "pHIC-202")):
+            if hi_n < lo_n:
+                continue
+            xa, xb = cx(lo_n) - bw / 2, cx(hi_n) + bw / 2
+            out.append(f'<path d="M{xa},{top - 22} L{xa},{top - 30} L{xb},{top - 30} L{xb},{top - 22}" '
+                       f'fill="none" stroke="#52514e" stroke-width="1"/>')
+            out.append(f'<text x="{(xa + xb) / 2}" y="{top - 36}" font-size="11" text-anchor="middle" fill="#0b0b0b">'
+                       f'{name} section · stages {lo_n}–{hi_n} · pH {ph:.2f}</text>')
+            # bubble at the outer end of the bracket, clear of the centred title and the feed line
+            bx = xa + 22 if name == "Extraction" else xb - 22
+            out.append(_bubble(bx, top - 80, tag, ""))
+            out.append(f'<text x="{bx + (24 if name == "Extraction" else -24)}" y="{top - 84}" font-size="9" '
+                       f'text-anchor="{"start" if name == "Extraction" else "end"}" fill="#52514e">acid/alkali dosing (ideal)</text>')
+            out.append(_signal([(bx, top - 61), (bx, top - 30)]))
+
+        # ---- stages
+        tr = trend if trend is not None else np.zeros(N, int)
+        hl = (mid - top) - 8                          # max bar height in a layer
+        for n in range(1, N + 1):
+            s = n - 1
+            xs_ = u[:, 4 * s + 2]                      # settler aqueous (light, heavy)
+            ys_ = u[:, 4 * s + 3]                      # settler organic
+            xm_, ym_ = u[:, 4 * s], u[:, 4 * s + 1]
+            share = 100 * xs_[1] / max(xs_.sum(), 1e-12)
+            tip = (f"Stage {n} ({'extraction' if n <= f else 'scrub'}{', feed stage' if n == f else ''})\n"
+                   f"Settler organic: {light} {ys_[0]:.2f}, {heavy} {ys_[1]:.2f} mmol/L\n"
+                   f"Settler aqueous: {light} {xs_[0]:.2f}, {heavy} {xs_[1]:.2f} mmol/L\n"
+                   f"Mixer aqueous:   {light} {xm_[0]:.2f}, {heavy} {xm_[1]:.2f} mmol/L\n"
+                   f"Mixer organic:   {light} {ym_[0]:.2f}, {heavy} {ym_[1]:.2f} mmol/L\n"
+                   f"Heavy share of aqueous metal: {share:.1f} %")
+            xl = cx(n) - bw / 2
+            out.append(f'<g class="stage"><title>{_esc(tip)}</title>')
+            out.append(f'<rect x="{xl}" y="{top}" width="{bw}" height="{mid - top}" fill="#f4efe1" stroke="#52514e" stroke-width="1"/>')
+            out.append(f'<rect x="{xl}" y="{mid}" width="{bw}" height="{bot - mid}" fill="#e7eff6" stroke="#52514e" stroke-width="1"/>')
+            barw = bw * 0.36
+            for j, (vals, y_base, sc) in enumerate(((ys_, mid - 4, scale_org), (xs_, bot - 4, scale_aq))):
+                for e in range(2):
+                    h = min(hl, hl * vals[e] / max(sc, 1e-12))
+                    bx_ = xl + bw * (0.1 + 0.44 * e)
+                    out.append(f'<rect x="{bx_:.2f}" y="{y_base - h:.2f}" width="{barw:.2f}" height="{h:.2f}" '
+                               f'fill="{colors[light if e == 0 else heavy]}" rx="1"/>')
+            out.append("</g>")
+            if N <= 30 or n % max(1, N // 15) == 0 or n in (1, f, N):
+                out.append(f'<text x="{cx(n)}" y="{bot + 14}" font-size="9" text-anchor="middle" fill="#52514e">{n}</text>')
+            if tr[n - 1] != 0:
+                sym, col = ("▲", "#b4521f") if tr[n - 1] > 0 else ("▼", "#2a78d6")
+                out.append(f'<text x="{cx(n)}" y="{top - 6}" font-size="10" text-anchor="middle" fill="{col}">{sym}</text>')
+            # inter-stage streams: organic to the right, aqueous to the left
+            if n < N:
+                gx0, gx1 = cx(n) + bw / 2, cx(n + 1) - bw / 2
+                out.append(f'<line x1="{gx0}" y1="{yo}" x2="{gx1}" y2="{yo}" stroke="#0b0b0b" stroke-width="1.2"/>')
+                out.append(f'<line x1="{gx1}" y1="{ya}" x2="{gx0}" y2="{ya}" stroke="#0b0b0b" stroke-width="1.2"/>')
+
+        # ---- feed line with FT-102 (and ratio relay FY-102)
+        xf = cx(f)
+        out.append(f'<line x1="{xf}" y1="40" x2="{xf}" y2="{top}" stroke="#0b0b0b" stroke-width="2" marker-end="url(#ah)"/>')
+        out.append(f'<text x="{xf + 8}" y="40" font-size="11" fill="#0b0b0b">Feed F = {flows["F"]:.2f} L/min '
+                   f'({light}+{heavy}, {plant["cF"]:.0f} mmol/L)</text>')
+        out.append(f'<line x1="{xf}" y1="62" x2="{xf - 30}" y2="62" stroke="#52514e" stroke-width="1"/>')
+        out.append(_bubble(xf - 50, 62, "FT-102", ""))
+
+        # ---- solvent inlet (left, organic level) with FIC-101 and valve
+        out.append(f'<line x1="20" y1="{yo}" x2="{cx(1) - bw / 2}" y2="{yo}" stroke="#0b0b0b" stroke-width="2" marker-end="url(#ah)"/>')
+        out.append(f'<text x="20" y="{yo - 8}" font-size="11" fill="#0b0b0b">Fresh solvent S</text>')
+        out.append(_valve(120, yo))
+        out.append(_bubble(120, yo - 62, "FIC-101", f"S = {flows['S']:.2f} L/min", sub_at=(120, yo + 20)))
+        out.append(_signal([(120, yo - 43), (120, yo - 6)]))
+        # ratio feedforward FT-102 -> FY-102 (x) -> FIC-101 setpoint
+        out.append(_bubble(45, 62, "FY-102", "S/F ratio", active=ff, sub_at=(68, 94), anchor="start"))
+        out.append(_signal([(xf - 69, 62), (64, 62)], active=ff))
+        out.append(_signal([(45, 81), (45, yo - 62), (101, yo - 62)], active=ff))
+
+        # ---- raffinate outlet (left, aqueous level) with AT-101 -> AIC-101 -> FIC-101
+        out.append(f'<line x1="{cx(1) - bw / 2}" y1="{ya}" x2="20" y2="{ya}" stroke="#0b0b0b" stroke-width="2" marker-end="url(#ah)"/>')
+        out.append(f'<text x="20" y="{ya + 18}" font-size="11" fill="#0b0b0b">Raffinate ({light} product)</text>')
+        out.append(f'<line x1="140" y1="{ya}" x2="140" y2="{ya + 50}" stroke="#52514e" stroke-width="1"/>')
+        out.append(_bubble(140, ya + 69, "AT-101", f"delay {ctrl.get('delay', 0):.0f} min",
+                           sub_at=(115, ya + 73), anchor="end"))
+        aic_txt = (f"PV {ctrl['pv']:.2f} % · meas {ctrl['meas']:.2f} % · SP {ctrl['sp']:.2f} %"
+                   if ctrl.get("pv") is not None else "")
+        out.append(_bubble(70, ya + 150, "AIC-101", "", active=auto))
+        out.append(f'<text x="20" y="{ya + 186}" font-size="9" fill="#52514e">{_esc(aic_txt)}</text>')
+        out.append(f'<text x="20" y="{ya + 198}" font-size="9" fill="{"#0b0b0b" if auto else "#b4521f"}" '
+                   f'font-weight="600">{_esc({"MAN": "MANUAL (loop open)", "AUTO": "AUTO (PI)", "AUTO-P": "AUTO (P only)", "AUTO+FF": "AUTO (PI) + ratio FF"}.get(mode, mode))}</text>')
+        out.append(_signal([(140, ya + 88), (140, ya + 150), (89, ya + 150)]))
+        out.append(_signal([(51, ya + 150), (12, ya + 150), (12, yo - 85), (101, yo - 70)], active=auto))
+
+        # ---- extract outlet (right, organic level) and scrub inlet with FIC-103
+        xr = cx(N) + bw / 2
+        out.append(f'<line x1="{xr}" y1="{yo}" x2="{W_svg - 20}" y2="{yo}" stroke="#0b0b0b" stroke-width="2" marker-end="url(#ah)"/>')
+        out.append(f'<text x="{W_svg - 20}" y="{yo - 8}" font-size="11" text-anchor="end" fill="#0b0b0b">Loaded organic → extract ({heavy})</text>')
+        out.append(f'<line x1="{W_svg - 20}" y1="{ya}" x2="{xr}" y2="{ya}" stroke="#0b0b0b" stroke-width="2" marker-end="url(#ah)"/>')
+        out.append(f'<text x="{W_svg - 20}" y="{ya + 18}" font-size="11" text-anchor="end" fill="#0b0b0b">Scrub liquor W</text>')
+        out.append(_valve(W_svg - 110, ya))
+        out.append(_bubble(W_svg - 110, ya + 69, "FIC-103", f"W = {flows['W']:.2f} L/min"))
+        out.append(_signal([(W_svg - 110, ya + 50), (W_svg - 110, ya + 6)]))
+        # interface level control, drawn once on the last settler (one per settler in practice)
+        out.append(_bubble(xr + 40, mid - 2, "LIC-1xx", "", r=15))
+        out.append(f'<text x="{xr + 40}" y="{mid + 26}" font-size="8" text-anchor="middle" fill="#52514e">each settler</text>')
+
+        # ---- legend
+        ly = H_svg - 52
+        out.append(f'<text x="200" y="{ly}" font-size="11" fill="#0b0b0b" font-weight="600">{_esc(time_label)}</text>')
+        items = [(colors[light], f"{light} (light)"), (colors[heavy], f"{heavy} (heavy)"),
+                 ("#f4efe1", f"organic layer, full bar = {scale_org:.0f} mmol/L"),
+                 ("#e7eff6", f"aqueous layer, full bar = {scale_aq:.0f} mmol/L")]
+        lx = 200
+        for colr, txt in items:
+            out.append(f'<rect x="{lx}" y="{ly + 12}" width="12" height="12" fill="{colr}" stroke="#52514e" stroke-width="0.5"/>'
+                       f'<text x="{lx + 17}" y="{ly + 22}" font-size="10" fill="#52514e">{_esc(txt)}</text>')
+            lx += 40 + 6.2 * len(txt)
+        out.append(f'<text x="200" y="{ly + 42}" font-size="10" fill="#52514e">○ instrument (line = control room) · '
+                   '– – – signal · ⋈ control valve · ▲/▼ stage metal rising/falling &gt; 2 %/h · greyed = not active · '
+                   'hover a stage for values</text>')
+        out.append("</svg>")
+        return "".join(out)
+
+    return pid_svg, stage_trend
 
 
 @app.cell
@@ -991,6 +1213,7 @@ can reproduce every figure on page 2.
 | 8 · Step test, process model and tuning rules | B4, B9, B12 |
 | 9 · Frequency response and stability margins | B11 |
 | 10 · Disturbance rejection: P, PI and feedforward | B10, B13, B15, B16 |
+| 11 · Interactive P&ID | B2, B13, B14 (reading the P&ID), B8, B15 |
 | (background for all of Part B) | B1, B2, B14, B17 |
 """
     )
@@ -1788,6 +2011,38 @@ handle nonlinearity.
 * **Alarms, interlocks and safety systems.** The diluent is flammable, so ventilation, low static generation and
   fire protection are part of the design.
 
+#### Reading the lab's P&ID  → *Lab 11*
+A **piping and instrumentation diagram** (P&ID) shows the process equipment, the process streams and every instrument
+and control loop. Its conventions follow ISA-5.1:
+
+| Symbol | Meaning |
+|---|---|
+| Solid line with arrow | Process stream (organic to the right, aqueous to the left) |
+| Dashed line | Instrument signal (measurement or controller output) |
+| Circle ("bubble") with a horizontal line | Instrument function mounted in the control room / DCS |
+| Tag letters | First letter = measured variable (F flow, A analysis, L level, pH); next letters = function (T transmitter, I indicator, C controller, Y relay/computation) |
+| Tag number | Loop number: every instrument in one loop shares it (AT-101 → AIC-101 → FIC-101) |
+| Bow-tie | Control valve, or a pump speed drive acting as the final control element |
+
+**Loops drawn in Lab 11:**
+
+* **FIC-101 (solvent flow)** is the fast inner loop. It holds S at its setpoint by adjusting the solvent valve or pump.
+* **AT-101 → AIC-101 → FIC-101** is the composition loop. The analyzer on the raffinate (with its dead time) feeds the
+  PI controller, whose output is the **setpoint** of FIC-101. This is **cascade control** (B13). In *MANUAL* the AIC is
+  greyed and S stays fixed, which is how start-up and the open-loop disturbance are run.
+* **FT-102 → FY-102 → FIC-101** is the feed-ratio feedforward. FY-102 multiplies the measured feed flow by the S/F ratio.
+  It is active (black) only in the "PI + feedforward ratio" mode.
+* **FIC-103** holds the scrub flow W. In the "Scrub flow −20 %" disturbance it is the scrub flow itself that is
+  stepped, as if this loop's setpoint had been changed wrongly.
+* **pHIC-201/202** hold the acidity of the extraction and scrub sections. **LIC** loops (one per settler, drawn once)
+  hold each interface level. The lab treats both as perfect (B14, B17).
+
+**The stage symbols are live.** Each stage is drawn as a settler with its organic layer on top and its aqueous layer
+below. The bars show the light and heavy element concentrations leaving that stage. Change nExt or nScr in section 5 and the
+number of stages redraws. ▲/▼ marks stages whose metal content is still rising or falling by more than 2 % per hour.
+During start-up (B8) the arrows show the profile filling outward from the feed stage. After a disturbance (B15) they show
+the upset travelling through the cascade, and in closed loop the controller pulling it back.
+
 ### B15 · The disturbances in this lab  → *Lab 10*
 Each is applied as a step at $t = 0$ from steady state.
 
@@ -1923,7 +2178,7 @@ def _(PAGES, mo, nav):
     mo.md(
         "## 2 · Interactive lab\n"
         "The lab has two halves of equal weight. **Part A, Separations** (sections 1–5) goes from one equilibrium "
-        "contact to a full extraction/scrub cascade. **Part B, Process dynamics and control** (sections 6–10) turns that "
+        "contact to a full extraction/scrub cascade. **Part B, Process dynamics and control** (sections 6–11) turns that "
         "cascade into a mixer-settler plant and controls it. Every chart updates live. Each section has a matching "
         "concept section on page 1, and the code is on page 3.\n\n"
         "---\n## Part A · Separations"
@@ -2237,7 +2492,7 @@ def _(PAGES, mo, nav):
     mo.stop(nav.value != PAGES[1])
     mo.md(
         "---\n## Part B · Process dynamics and control\n"
-        "Sections 6–10 build the section 5 cascade as a plant of real mixer-settlers. They use the same pair, stages, "
+        "Sections 6–11 build the section 5 cascade as a plant of real mixer-settlers. They use the same pair, stages, "
         "S and W (scaled by the feed flow F) and pH values. You can then watch the plant fill, find "
         "its step response, tune a PI controller and reject disturbances. The concepts are in **Part B** of page 1."
     )
@@ -2619,6 +2874,128 @@ def _(
     return
 
 
+# --------------------------------------------------- Section 11: interactive P&ID
+@app.cell(hide_code=True)
+def _(mo):
+    PID_SCENARIOS = ["Steady state", "Start-up (feed switched on at t = 0)",
+                     "Disturbance, open loop (section 10)", "Disturbance, closed loop (section 10)"]
+    dd_pid = mo.ui.dropdown(PID_SCENARIOS, value=PID_SCENARIOS[1], label="Scenario")
+    sw_play = mo.ui.switch(value=False, label="Play")
+    refresher = mo.ui.refresh(options=["0.5s", "1s", "2s"], default_interval="1s", label="Speed")
+    get_frame, set_frame = mo.state(0)
+    return PID_SCENARIOS, dd_pid, get_frame, refresher, set_frame, sw_play
+
+
+@app.cell(hide_code=True)
+def _(
+    PID_SCENARIOS,
+    closed_loop,
+    dd_mode,
+    dd_pid,
+    np,
+    open_loop,
+    plant,
+    set_frame,
+    sl_delay,
+    startup,
+):
+    # Collect the frames, times, flows and controller readings for the chosen scenario.
+    def _heavy_share(u, L1):
+        r = L1 * u[:, 2]
+        return float(100 * r[1] / r.sum()) if r.sum() > 1e-9 else None
+
+    _L1 = plant["W"] + plant["F"]
+    _sp = _heavy_share(startup["u_ss"], _L1)
+    _sc = dd_pid.value
+    if _sc == PID_SCENARIOS[0]:
+        _frames, _t = startup["u_ss"][None], np.array([0.0])
+        _flows = [dict(S=plant["S"], W=plant["W"], F=plant["F"])]
+        _mode = {"P only": "AUTO-P", "PI": "AUTO"}.get(dd_mode.value, "AUTO+FF")
+        _ctrl = [dict(mode=_mode, pv=_sp, meas=_sp, sp=_sp, delay=sl_delay.value)]
+    elif _sc == PID_SCENARIOS[1]:
+        _frames, _t = startup["frames"], startup["t"][startup["frame_k"]] / 60.0
+        _flows = [dict(S=plant["S"], W=plant["W"], F=plant["F"])] * len(_frames)
+        _ctrl = [dict(mode="MAN", pv=_heavy_share(_u, _L1), meas=_heavy_share(_u, _L1), sp=_sp,
+                      delay=sl_delay.value) for _u in _frames]
+        _ctrl = [dict(_c, pv=None) if _c["pv"] is None else _c for _c in _ctrl]
+    else:
+        _run = open_loop if _sc == PID_SCENARIOS[2] else closed_loop
+        _frames, _k = _run["frames"], _run["frame_k"]
+        _t = _run["t"][_k] / 60.0
+        if not _run["closed_loop"]:
+            _mode = "MAN"
+        else:
+            _mode = {"P only": "AUTO-P", "PI": "AUTO"}.get(_run["mode"], "AUTO+FF")
+        _flows = [dict(S=float(_run["S"][k]), W=_run["W_run"] if k > 0 else plant["W"],
+                       F=_run["F_run"] if k > 0 else plant["F"]) for k in _k]
+        _ctrl = [dict(mode=_mode, pv=float(_run["cv"][k]), meas=float(_run["cv"][max(0, k - _run["nd"])]),
+                      sp=_run["sp"], delay=sl_delay.value) for k in _k]
+    pid_data = dict(frames=_frames, t=_t, flows=_flows, ctrl=_ctrl, scenario=_sc,
+                    scale_aq=float(np.ceil(_frames[:, :, 2::4].max() / 10) * 10 or 10),
+                    scale_org=float(np.ceil(_frames[:, :, 3::4].max() / 10) * 10 or 10))
+    set_frame(0)
+    return (pid_data,)
+
+
+@app.cell(hide_code=True)
+def _(pid_data, refresher, set_frame, sw_play):
+    # Advance one frame on every timer tick while Play is on.
+    refresher.value
+    if sw_play.value and len(pid_data["frames"]) > 1:
+        set_frame(lambda i: (i + 1) % len(pid_data["frames"]))
+    return
+
+
+@app.cell(hide_code=True)
+def _(get_frame, mo, pid_data, set_frame):
+    _n = len(pid_data["frames"])
+    sl_frame = mo.ui.slider(0, max(_n - 1, 1), 1, value=min(get_frame(), _n - 1), on_change=set_frame,
+                            label="Time", show_value=False, debounce=True, disabled=_n == 1)
+    return (sl_frame,)
+
+
+@app.cell(hide_code=True)
+def _(
+    COLORS,
+    dd_pid,
+    get_frame,
+    mo,
+    pid_data,
+    pid_svg,
+    plant,
+    refresher,
+    sl_frame,
+    stage_trend,
+    sw_play,
+):
+    _i = min(get_frame(), len(pid_data["frames"]) - 1)
+    _u = pid_data["frames"][_i]
+    _prev = pid_data["frames"][_i - 1] if _i > 0 else None
+    _dt_h = float(pid_data["t"][_i] - pid_data["t"][_i - 1]) if _i > 0 else 0.0
+    _fl, _ct = pid_data["flows"][_i], pid_data["ctrl"][_i]
+    _r = (_fl["W"] + _fl["F"]) * _u[:, 2]
+    _e = _fl["S"] * _u[:, -1]
+    _pr = f"{100 * _r[0] / _r.sum():.1f} %" if _r.sum() > 1e-6 else "–"
+    _pe = f"{100 * _e[1] / _e.sum():.1f} %" if _e.sum() > 1e-6 else "–"
+    _label = (f"{pid_data['scenario'].split(' (')[0]} · t = {pid_data['t'][_i]:.1f} h · "
+              f"raffinate {plant['light']} purity {_pr} · extract {plant['heavy']} purity {_pe}")
+    _svg = pid_svg(plant, _u, COLORS, pid_data["scale_aq"], pid_data["scale_org"], _fl, _ct,
+                   _label, stage_trend(_u, _prev, _dt_h))
+    mo.vstack([
+        mo.md("### 11 · Interactive P&ID\n"
+              f"The cascade from section 5 ({plant['N']} stages: {plant['n_ext']} extraction + {plant['n_scr']} scrub) "
+              "drawn as a piping and instrumentation diagram. Bars show the settler concentrations of each element "
+              "in the organic (top) and aqueous (bottom) layer of every stage. **Hover over a stage** for exact "
+              "values. Choose a scenario, then drag the time slider or press **Play**. The disturbance, controller mode and tuning "
+              "come from section 10. Symbols are explained on page 1, B14."),
+        mo.hstack([dd_pid, sw_play, refresher], justify="start", gap=1.5, wrap=True),
+        mo.hstack([sl_frame, mo.md(f"t = **{pid_data['t'][_i]:.1f} h** (frame {_i + 1} of {len(pid_data['frames'])})")],
+                  justify="start", gap=1.5),
+        mo.Html(_svg),
+    ])
+    return
+
+
 # ============================================================================
 # PAGE 3: Python code
 # ============================================================================
@@ -2635,6 +3012,7 @@ def _(
     mo,
     nav,
     new_figure,
+    pid_svg,
     run_tests,
     simulate_disturbance,
     stability_margins,
@@ -2660,6 +3038,7 @@ def _(
         ("Mixer-settler dynamics, efficiency sweep and start-up (implicit Euler)", assemble),
         ("Step test, FOPDT fit, SIMC tuning, P/PI/feedforward control and disturbances", simulate_disturbance),
         ("Frequency response, stability margins and PI tuning rules", stability_margins),
+        ("Interactive P&ID drawing (SVG)", pid_svg),
         ("Tests", run_tests),
         ("Plotting helpers", new_figure),
     ]
@@ -2779,6 +3158,10 @@ conditions. Published β for Ce/La range from about 4 to above 50 depending on t
 * **Stability margins** are computed on the fitted FOPDT model plus the analyzer delay. The full plant was checked by
   simulation: its true P-only stability limit (LG between 60 and 65) is about twice the model's (about 28). Page 1, B11
   discusses this.
+* **Interactive P&ID (Lab 11):** drawn as SVG in Python (no extra libraries). Tags follow ISA-5.1 style but the loop
+  numbers are invented. Frames are stored every 30 min of simulated time (every 15 integration steps). Bars show the
+  settler outlet concentrations, and ▲/▼ mark stages whose settler metal changes by more than 2 % per hour. Play uses
+  marimo's refresh timer. The pH and level loops are drawn but treated as ideal.
 * **Feedforward** is static (S = S0·F/F0 using the measured feed flow, with no lag) and acts only on the feed-flow disturbance.
 * **SIMC closed-loop time constant:** τ_c is set to the total dead time (process θ + analyzer delay), the usual "tight
   control" choice.
