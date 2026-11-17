@@ -5,13 +5,15 @@ solvent extraction with PC88A / D2EHPA. It is split evenly between two halves:
 
 * **Part A, Separations:** liquid–liquid extraction basics, equilibrium, Fenske/Kremser staging, McCabe–Thiele
   with loading, and the extraction/scrub cascade.
-* **Part B, Process dynamics and control:** mixer-settler hydraulics and stage efficiency, start-up, step-test
-  identification (FOPDT and SIMC), and PI disturbance rejection.
+* **Part B, Process dynamics and control:** process-control theory (modelling, transfer functions, P/PI/PID,
+  stability and frequency response, tuning rules, feedforward, cascade and multivariable control) applied to a
+  mixer-settler plant: hydraulics and stage efficiency, start-up, step-test identification, Bode plot with
+  stability margins, and disturbance rejection with P, PI and feedforward control.
 
 The four pages are:
 
-1. **Concepts and governing equations:** background on liquid–liquid extraction, plus a concept section for every lab section
-2. **Interactive lab:** sections 1–5 (Part A) and 6–9 (Part B)
+1. **Concepts and governing equations:** a textbook-style chapter (A1–A9 separations, B1–B17 dynamics and control) with derivations and worked examples
+2. **Interactive lab:** sections 1–5 (Part A) and 6–10 (Part B)
 3. **Python code:** every function in full, plus an in-notebook test suite with a pass/fail table
 4. **Attribution:** an AI-generated project; lists models, services and references, with an author placeholder
 
