@@ -515,7 +515,18 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
 
 
 @app.cell
-def _(KL, assemble, band_lu, band_solve, np, steady_state):
+def _(
+    H_FEED,
+    KL,
+    PH_D_RANGE,
+    assemble,
+    band_lu,
+    band_solve,
+    inner_advance,
+    inner_init,
+    np,
+    steady_state,
+):
     # --------------------------------------------------------------- PI control
     # Controlled variable: heavy-element share (%) in the raffinate, seen through
     # an analyzer dead time. Manipulated variable: solvent flow S, limited to
@@ -527,6 +538,9 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         "Feed composition 50:50 → 60:40 heavy:light": dict(frac_heavy=0.6),
         "Extraction pH −0.05": dict(dpH_ext=-0.05),
         "Scrub flow −20%": dict(W=0.8),
+        "Solvent supply pressure −15% (inner-loop upset)": dict(supply=0.85),
+        "Feed acidity +50%": dict(acid_factor=1.5),
+        "Feed acidity −80% (needs acid: crosses the split)": dict(acid_factor=0.2),
     }
 
     def heavy_share_raffinate(u, L1):
@@ -543,6 +557,8 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         return (cv[0] - cv[1]) / (2 * rel * plant["S"])
 
     def disturbance_overrides(plant, name):
+        """Assemble() overrides for a disturbance (supply and acidity are handled
+        by the inner loops, not by assemble)."""
         d = DISTURBANCES[name]
         kw = {}
         if "F" in d:
@@ -611,7 +627,8 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
     CONTROL_MODES = ["PI", "P only", "PI + feedforward ratio (S/F)"]
 
     def simulate_disturbance(plant, name, closed_loop, LG=2.0, Ti=120.0, delay=10.0,
-                             t_end=None, nsteps=None, limit=0.5, mode="PI", frame_every=15):
+                             t_end=None, nsteps=None, limit=0.5, mode="PI", frame_every=15,
+                             flow_mode="ideal", ph_mode="ideal", ph_LG=4.0):
         """Step disturbance at t = 0 from the nominal steady state.
 
         mode = "PI": feedback PI on the delayed analyzer signal.
@@ -619,14 +636,30 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         mode = "PI + feedforward ratio (S/F)": the solvent flow follows the measured
                feed flow (S = S0 F/F0, a static feedforward / ratio controller)
                and PI feedback trims it.
-        Also records the (uncontrolled) extract purity, IAE, ISE and the fraction of
-        time the solvent flow sits on a limit."""
+        flow_mode = "ideal" (S equals the AIC output), "cascade" (AIC-101 sets the
+               setpoint of the FIC-101 flow loop) or "single" (AIC-101 drives the
+               valve directly).
+        ph_mode = "ideal" (fixed extraction pH), "split" (split-range PI pHIC-201 on
+               acid/alkali dosing) or "manual" (dosing valves frozen).
+        Also records the (uncontrolled) extract purity, IAE, ISE, the fraction of
+        time the AIC output sits on a limit, and the inner-loop variables."""
         if t_end is None:
             t_end = float(np.clip(2.25 * plant["holdup"] / plant["F"], 36 * 60.0, 200 * 60.0))
         if nsteps is None:
             nsteps = int(round(t_end / 2.0))      # dt = 2 min at the default size
         dt = t_end / nsteps
         kw = disturbance_overrides(plant, name)
+        d = DISTURBANCES[name]
+        supply = d.get("supply", 1.0)
+        acid_factor = d.get("acid_factor", 1.0)
+        if ph_mode != "ideal" and "dpH_ext" in kw:
+            # with a dynamic pH, the "pH -0.05" upset is caused by extra feed acid: the
+            # increase that would lower the extraction pH by 0.05 with the valves fixed
+            h0 = 10.0 ** (-plant["pH_ext"])
+            dh = h0 * (10.0 ** (-kw.pop("dpH_ext")) - 1.0)
+            acid_factor = 1.0 + (plant["W"] + plant["F"]) * dh / (plant["F"] * H_FEED)
+        F_run, W_run = kw.get("F", plant["F"]), kw.get("W", plant["W"])
+        dpH_fixed = kw.pop("dpH_ext", 0.0)
         S0 = plant["S"]
         u = steady_state(plant)
         L1_nominal = assemble(plant)[3][0]
@@ -636,9 +669,16 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         nd = int(round(delay / dt))
         t = np.arange(nsteps + 1) * dt
         cv = np.zeros(nsteps + 1)
-        s_hist = np.zeros(nsteps + 1)
+        s_hist = np.zeros(nsteps + 1)              # actual solvent flow
+        ssp_hist = np.full(nsteps + 1, S0)         # AIC-101 output (flow setpoint)
+        ph_hist = np.full(nsteps + 1, plant["pH_ext"])
+        v_hist = np.full(nsteps + 1, 50.0)         # solvent valve %
+        upH_hist, acid_hist, alk_hist = (np.zeros(nsteps + 1) for _ in range(3))
         ext = np.zeros(nsteps + 1)
         cv[0], s_hist[0] = sp, S0
+        inner = inner_init(plant)
+        upH_hist[0], acid_hist[0], alk_hist[0] = inner["u"], inner["acid"], inner["alk"]
+        use_inner = flow_mode != "ideal" or ph_mode != "ideal"
         e_flow = S0 * u[:, -1]
         ext[0] = 100.0 * e_flow[1] / e_flow.sum()
         integral, S = 0.0, S0
@@ -646,20 +686,32 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         use_i = mode != "P only"
         # feedforward: the feed flow is measured without delay; S/F held at its nominal ratio
         S_base = S0 * kw.get("F", plant["F"]) / plant["F"] if mode.startswith("PI +") else S0
-        cached_S, lu = None, None
+        cached, lu = None, None
         frames, frame_k = [u.copy()], [0]           # full states for the P&ID animation
         for k in range(1, nsteps + 1):
-            if S != cached_S:                       # refactor only when S moves
-                ab, b, m, L, _ = assemble(plant, S=S, **kw)
+            S_sp = S                                 # AIC-101 output held over this step
+            if use_inner:                            # fast loops between AIC output and the plant
+                S, ph_now = inner_advance(inner, plant, S_sp, dt, flow_mode, ph_mode, F_run, W_run,
+                                          acid_factor, supply, ph_LG)
+                # the D model is clamped to +/-1 pH around setpoint (flagged in the output)
+                dpH = (float(np.clip(ph_now - plant["pH_ext"], -PH_D_RANGE, PH_D_RANGE))
+                       if ph_mode != "ideal" else dpH_fixed)
+            else:
+                ph_now, dpH = plant["pH_ext"] + dpH_fixed, dpH_fixed
+            key = (round(S, 10), round(dpH, 10))
+            if key != cached:                        # refactor only when S or pH moves
+                ab, b, m, L, _ = assemble(plant, S=S, dpH_ext=dpH, **kw)
                 A = ab.copy()
                 A[:, :, KL] += m / dt
-                lu, cached_S = band_lu(A), S
+                lu, cached = band_lu(A), key
             u = band_solve(lu, b + (m / dt) * u)
             if k % frame_every == 0:
                 frames.append(u.copy())
                 frame_k.append(k)
             cv[k] = heavy_share_raffinate(u, L[0])
-            s_hist[k] = S
+            s_hist[k], ssp_hist[k], ph_hist[k] = S, S_sp, ph_now
+            v_hist[k] = inner["v"] if flow_mode != "ideal" else 50.0 * S / S0
+            upH_hist[k], acid_hist[k], alk_hist[k] = inner["u"], inner["acid"], inner["alk"]
             e_flow = S * u[:, -1]
             ext[k] = 100.0 * e_flow[1] / e_flow.sum()   # heavy purity of the extract
             if closed_loop:
@@ -670,16 +722,22 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
                     if lo < trial < hi or (trial >= hi and e < 0) or (trial <= lo and e > 0):
                         integral += e * dt          # conditional integration
                 S = float(np.clip(S_base + Kc * (e + (integral / Ti if use_i else 0.0)), lo, hi))
+            else:
+                S = S_sp
         dev = np.abs(cv - sp)
-        on_limit = (np.abs(s_hist - lo) < 1e-9) | (np.abs(s_hist - hi) < 1e-9)
+        on_limit = (np.abs(ssp_hist - lo) < 1e-9) | (np.abs(ssp_hist - hi) < 1e-9)
         return dict(t=t, cv=cv, S=s_hist, ext=ext, sp=sp, Kp=Kp, Kc=Kc,
                     peak=float(np.max(dev)), t_peak=float(t[int(np.argmax(dev))]),
                     final=float(cv[-1]),
                     iae=float(np.sum(0.5 * (dev[1:] + dev[:-1])) * dt / 60.0),  # point-hours
                     ise=float(np.sum(0.5 * (dev[1:] ** 2 + dev[:-1] ** 2)) * dt / 60.0),
                     sat_frac=float(np.mean(on_limit)), frames=np.array(frames),
-                    frame_k=np.array(frame_k), nd=nd, dt=dt, F_run=kw.get("F", plant["F"]),
-                    W_run=kw.get("W", plant["W"]), mode=mode, closed_loop=closed_loop)
+                    frame_k=np.array(frame_k), nd=nd, dt=dt, F_run=F_run, W_run=W_run,
+                    mode=mode, closed_loop=closed_loop, flow_mode=flow_mode, ph_mode=ph_mode,
+                    S_sp=ssp_hist, valve=v_hist, pH=ph_hist, u_ph=upH_hist, acid=acid_hist,
+                    alk=alk_hist, supply=supply, acid_factor=acid_factor,
+                    ph_peak=float(np.max(np.abs(ph_hist - plant["pH_ext"]))),
+                    ph_out_of_range=bool(np.any(np.abs(ph_hist - plant["pH_ext"]) > PH_D_RANGE)))
 
     return (
         CONTROL_MODES,
@@ -691,6 +749,165 @@ def _(KL, assemble, band_lu, band_solve, np, steady_state):
         simc_tuning,
         simulate_disturbance,
         step_test,
+    )
+
+
+@app.cell
+def _(np):
+    # ------------------- inner loops: cascade flow control and split-range pH control
+    # Fast loops that sit under the composition controller AIC-101:
+    #   * FIC-101 (slave of a cascade): PI on solvent flow, driving a valve whose
+    #     capacity depends on the solvent supply pressure.
+    #   * pHIC-201 (split range): PI on extraction-section pH whose single output
+    #     drives an acid valve (0-50 %) and an alkali valve (50-100 %).
+    # They are integrated with small sub-steps inside each plant time step.
+    TAU_VALVE = 0.1      # min, valve / pump-speed response
+    TAU_PROBE = 0.5      # min, pH electrode lag
+    LAMBDA_FLOW = 0.2    # min, desired closed-loop time constant of FIC-101 (IMC tuning)
+    H_FEED = 0.025       # mol/L free acid in the feed (pH 1.6)
+    C_REAGENT = 1.0      # mol/L, strength of the HCl and NaOH dosing solutions
+    Q_DOSE_MAX = 0.05    # L/min per dosing valve at 100 % open, per L/min of nominal feed
+    DT_SUB = 0.05        # min, sub-step for the inner loops
+    KW = 1e-14           # water ion product (25 °C)
+    PH_D_RANGE = 1.0     # the distribution-ratio model is only trusted within ±1 pH of setpoint
+
+    FLOW_MODES = {"Cascade: AIC-101 → FIC-101 → valve": "cascade",
+                  "Single loop: AIC-101 → valve (no FIC)": "single",
+                  "Ideal flow (S = setpoint)": "ideal"}
+    PH_MODES = {"Ideal pH (fixed, as in sections 5–9)": "ideal",
+                "Split-range PI: pHIC-201 → acid / alkali valves": "split",
+                "Manual: dosing valves fixed": "manual"}
+
+    def split_range(u):
+        """Controller output u (0-100 %) -> (acid valve %, alkali valve %).
+        0-50 %: the acid valve closes from 100 % to 0; 50-100 %: the alkali valve
+        opens from 0 to 100 %. At exactly 50 % both are shut (no overlap, no gap)."""
+        u = min(max(float(u), 0.0), 100.0)
+        return max(0.0, 2.0 * (50.0 - u)), max(0.0, 2.0 * (u - 50.0))
+
+    def inlet_acidity(plant, F, W, acid_factor=1.0):
+        """Free acid (mol/L) of the aqueous entering the extraction section:
+        scrub liquor at the scrub pH mixed with the feed."""
+        return (W * 10.0 ** (-plant["pH_scr"]) + F * H_FEED * acid_factor) / (W + F)
+
+    def ph_from_net_acid(a):
+        """pH of a strong-acid / strong-base solution with net acid a (mol/L;
+        negative = excess base), from the charge balance [H+] - Kw/[H+] = a.
+        This is the titration curve: pH changes slowly while a >> 1e-7 and
+        jumps by several units as a passes through zero."""
+        h = 0.5 * (a + np.sqrt(a * a + 4.0 * KW))
+        return float(-np.log10(h))
+
+    def ph_volume(plant):
+        """Aqueous hold-up of the extraction section (L), lumped into one pH."""
+        return plant["n_ext"] * (plant["V_mix"] + plant["V_set"]) * (1.0 - plant["phi_o"][0])
+
+    def ph_output_for(plant, F, W, acid_factor=1.0):
+        """Split-range output (%) that holds the extraction pH at its setpoint at
+        steady state: alkali dose = L (h_in - h_sp), negative means acid."""
+        need = (W + F) * (inlet_acidity(plant, F, W, acid_factor) - 10.0 ** (-plant["pH_ext"]))
+        qmax = Q_DOSE_MAX * plant["F"] * C_REAGENT
+        return float(50.0 + 50.0 * np.clip(need / qmax, -1.0, 1.0))
+
+    def ph_process_model(plant):
+        """Linearised pH process seen by pHIC-201 at the nominal point:
+        Kp (pH units per % output) and time constant tau = V/L (min)."""
+        L = plant["W"] + plant["F"]
+        h = 10.0 ** (-plant["pH_ext"])
+        dq_du = 2.0 * Q_DOSE_MAX * plant["F"] * C_REAGENT / 100.0     # mol/min per %
+        return dq_du / (L * h * np.log(10.0)), ph_volume(plant) / L
+
+    def inner_init(plant):
+        """Inner-loop state at the nominal steady state."""
+        u0 = ph_output_for(plant, plant["F"], plant["W"])
+        a0, b0 = split_range(u0)
+        a0 = 10.0 ** (-plant["pH_ext"]) - KW * 10.0 ** plant["pH_ext"]   # net acid at the setpoint
+        return dict(v=50.0, I_f=0.0, a=a0, ph=plant["pH_ext"], ph_meas=plant["pH_ext"],
+                    u=u0, u0=u0, I_p=0.0, acid=a0, alk=b0)
+
+    def inner_advance(st, plant, S_sp, dt, flow_mode, ph_mode, F, W, acid_factor=1.0,
+                      supply=1.0, ph_LG=4.0, trace=None):
+        """Advance the inner loops over one plant step `dt` (min) in sub-steps.
+        Returns the time-averaged solvent flow and extraction pH over the step.
+        If `trace` is a list, (S, valve %) is appended after every sub-step."""
+        S0 = plant["S"]
+        Kv = S0 / 50.0                                   # L/min per % valve at nominal supply
+        n = max(1, int(round(dt / DT_SUB)))
+        ds = dt / n
+        kc_f, ti_f = TAU_VALVE / (Kv * LAMBDA_FLOW), TAU_VALVE        # IMC PI for FIC-101
+        kp_ph, tau_ph = ph_process_model(plant)
+        kc_p, ti_p = ph_LG / kp_ph, tau_ph                            # lambda PI for pHIC-201
+        L = W + F
+        h_in = inlet_acidity(plant, F, W, acid_factor)
+        V = ph_volume(plant)
+        qmax = Q_DOSE_MAX * plant["F"] * C_REAGENT
+        sp_ph = plant["pH_ext"]
+        a_v, a_p = np.exp(-ds / TAU_VALVE), np.exp(-ds / TAU_PROBE)
+        s_sum = ph_sum = 0.0
+        for _ in range(n):
+            # ---- solvent flow
+            if flow_mode == "ideal":
+                S = S_sp
+            else:
+                if flow_mode == "cascade":               # slave PI on measured flow
+                    e = S_sp - Kv * st["v"] * supply
+                    trial = 50.0 + kc_f * (e + (st["I_f"] + e * ds) / ti_f)
+                    if 0.0 < trial < 100.0 or (trial >= 100.0 and e < 0) or (trial <= 0.0 and e > 0):
+                        st["I_f"] += e * ds              # conditional integration
+                    c = min(max(50.0 + kc_f * (e + st["I_f"] / ti_f), 0.0), 100.0)
+                else:                                    # single loop: master output read as valve %
+                    c = min(max(50.0 * S_sp / S0, 0.0), 100.0)
+                st["v"] = c + (st["v"] - c) * a_v
+                S = Kv * st["v"] * supply
+            # ---- extraction-section acidity
+            if ph_mode != "ideal":
+                if ph_mode == "split":                   # pH too low -> raise the output (more alkali)
+                    e = sp_ph - st["ph_meas"]
+                    trial = st["u0"] + kc_p * (e + (st["I_p"] + e * ds) / ti_p)
+                    if 0.0 < trial < 100.0 or (trial >= 100.0 and e < 0) or (trial <= 0.0 and e > 0):
+                        st["I_p"] += e * ds
+                    st["u"] = min(max(st["u0"] + kc_p * (e + st["I_p"] / ti_p), 0.0), 100.0)
+                acid_cmd, alk_cmd = split_range(st["u"])
+                st["acid"] = acid_cmd + (st["acid"] - acid_cmd) * a_v
+                st["alk"] = alk_cmd + (st["alk"] - alk_cmd) * a_v
+                q_net = (st["alk"] - st["acid"]) / 100.0 * qmax          # mol/min of alkali
+                # net-acid balance on the lumped extraction-section aqueous
+                st["a"] = st["a"] + ds / V * (L * (h_in - st["a"]) - q_net)
+                st["ph"] = ph_from_net_acid(st["a"])
+                st["ph_meas"] = st["ph"] + (st["ph_meas"] - st["ph"]) * a_p
+            s_sum += S
+            ph_sum += st["ph"]
+            if trace is not None:
+                trace.append((S, st["v"]))
+        return s_sum / n, ph_sum / n
+
+    def flow_loop_trace(plant, flow_mode, supply=0.85, t_end=5.0):
+        """Fast view of the solvent flow alone after a supply-pressure step at
+        t = 0, with the master output frozen: (t, S, valve %) at every sub-step."""
+        st = inner_init(plant)
+        tr = [(plant["S"], 50.0)]
+        inner_advance(st, plant, plant["S"], t_end, flow_mode, "ideal", plant["F"], plant["W"],
+                      supply=supply, trace=tr)
+        arr = np.array(tr)
+        return np.arange(len(arr)) * DT_SUB, arr[:, 0], arr[:, 1]
+
+    return (
+        DT_SUB,
+        FLOW_MODES,
+        H_FEED,
+        LAMBDA_FLOW,
+        PH_D_RANGE,
+        PH_MODES,
+        TAU_VALVE,
+        flow_loop_trace,
+        inlet_acidity,
+        inner_advance,
+        inner_init,
+        ph_from_net_acid,
+        ph_output_for,
+        ph_process_model,
+        ph_volume,
+        split_range,
     )
 
 
@@ -794,9 +1011,13 @@ def _(
     simc_tuning,
     simulate_disturbance,
     cascade_overview_svg,
+    inner_advance,
+    inner_init,
     mixer_settler_detail_svg,
+    ph_from_net_acid,
     pid_svg,
     simulate_startup,
+    split_range,
     stability_margins,
     stage_trend,
     step_test,
@@ -945,6 +1166,43 @@ def _(
         check("stage trend: every stage is filling 1.5–2 h into start-up (count of ▲)", 20.0,
               float(np.sum(tr == 1)), 0.0)
 
+        # split-range map and pH chemistry
+        check("split range: output 0 % -> acid valve 100 %", 100.0, split_range(0.0)[0], 1e-12)
+        check("split range: output 50 % -> both valves shut", 0.0, sum(split_range(50.0)), 1e-12)
+        check("split range: output 75 % -> alkali valve 50 %", 50.0, split_range(75.0)[1], 1e-12)
+        check("titration curve: zero net acid gives pH 7", 7.0, ph_from_net_acid(0.0), 1e-9)
+        check("titration curve: 0.0126 mol/L acid gives pH 1.90", 1.90, ph_from_net_acid(0.0126), 0.005)
+
+        # inner loops hold the nominal steady state when nothing is disturbed
+        st_in = inner_init(plant)
+        S_avg, ph_avg = inner_advance(st_in, plant, plant["S"], 120.0, "cascade", "split",
+                                      plant["F"], plant["W"])
+        check("inner loops at nominal: solvent flow unchanged after 2 h (L/min)", plant["S"], S_avg, 1e-9)
+        check("inner loops at nominal: extraction pH unchanged after 2 h", plant["pH_ext"], ph_avg, 1e-6)
+
+        # cascade control rejects the inner-loop (supply-pressure) upset; a single loop does not
+        sup = "Solvent supply pressure −15% (inner-loop upset)"
+        r_cas = simulate_disturbance(plant, sup, True, flow_mode="cascade", t_end=24 * 60.0, nsteps=288)
+        r_sgl = simulate_disturbance(plant, sup, True, flow_mode="single", t_end=24 * 60.0, nsteps=288)
+        check("cascade: CV peak after supply −15 % (points)", 0.0, r_cas["peak"], 0.05)
+        check("single loop: supply −15 % reaches the CV (peak > 1 point; 1 = yes)", 1.0,
+              float(r_sgl["peak"] > 1.0), 0.0)
+        check("cascade: FIC-101 opens the valve to 50/0.85 = 58.8 %", 50.0 / 0.85, r_cas["valve"][-1], 0.05)
+        r_def = simulate_disturbance(plant, "Feed flow +20%", True, flow_mode="cascade")
+        check("cascade flow loop reproduces the ideal-flow PI peak (feed +20 %)", cl["peak"], r_def["peak"], 0.01)
+
+        # split-range pH control crosses from alkali to acid and holds the setpoint
+        acd = "Feed acidity −80% (needs acid: crosses the split)"
+        r_spl = simulate_disturbance(plant, acd, True, flow_mode="cascade", ph_mode="split",
+                                     t_end=24 * 60.0, nsteps=288)
+        r_man = simulate_disturbance(plant, acd, True, flow_mode="cascade", ph_mode="manual",
+                                     t_end=24 * 60.0, nsteps=288)
+        check("split range: output starts on the alkali side (> 50 %; 1 = yes)", 1.0, float(r_spl["u_ph"][0] > 50), 0.0)
+        check("split range: output ends on the acid side, acid valve open (1 = yes)", 1.0,
+              float(r_spl["u_ph"][-1] < 50 and r_spl["acid"][-1] > 1 and r_spl["alk"][-1] < 0.01), 0.0)
+        check("split range: extraction pH back at setpoint after 24 h", plant["pH_ext"], r_spl["pH"][-1], 0.01)
+        check("manual valves: pH runs out of the model range (1 = yes)", 1.0, float(r_man["ph_out_of_range"]), 0.0)
+
         # Figure A1 diagrams are well-formed SVG (XML)
         import xml.etree.ElementTree as _ET
         _ok = 1.0
@@ -965,6 +1223,114 @@ def _(
         return results
 
     return (run_tests,)
+
+
+@app.cell
+def _():
+    # ------------------------------------------- block diagrams: cascade and split range
+    def control_blocks_svg():
+        """Figure B1: block diagrams of (a) the cascade loop AIC-101 -> FIC-101 and
+        (b) the split-range loop pHIC-201 -> FY-201 -> acid / alkali valves."""
+        W, H = 1100, 470
+        ink, ink2, blue, orange = "#0b0b0b", "#52514e", "#2a78d6", "#b4521f"
+        o = [f'<svg viewBox="0 0 {W} {H}" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" '
+             'aria-label="Block diagrams of cascade and split-range control" '
+             'font-family="Inter, Helvetica, Arial, sans-serif">',
+             f'<rect width="{W}" height="{H}" fill="#fcfcfb"/>',
+             '<defs><marker id="bk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
+             f'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{ink}"/></marker></defs>']
+
+        def text(x, y, s, size=11, anchor="middle", col=ink, weight="normal"):
+            o.append(f'<text x="{x}" y="{y}" font-size="{size}" text-anchor="{anchor}" fill="{col}" '
+                     f'font-weight="{weight}">{s}</text>')
+
+        def block(x, y, w, h, l1, l2="", fill="#ffffff", col=ink):
+            o.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="4" fill="{fill}" stroke="{col}" stroke-width="1.5"/>')
+            text(x + w / 2, y + h / 2 - (3 if l2 else -4), l1, 11, col=col, weight="600")
+            if l2:
+                text(x + w / 2, y + h / 2 + 12, l2, 9, col=ink2)
+
+        def junction(x, y, signs):
+            o.append(f'<circle cx="{x}" cy="{y}" r="9" fill="#ffffff" stroke="{ink}" stroke-width="1.5"/>')
+            for dx, dy, sg in signs:
+                text(x + dx, y + dy, sg, 10)
+
+        def arrow(pts, col=ink, dash=False, width=1.6):
+            d = " ".join(f"{'M' if i == 0 else 'L'}{x},{y}" for i, (x, y) in enumerate(pts))
+            da = ' stroke-dasharray="5,3"' if dash else ""
+            o.append(f'<path d="{d}" fill="none" stroke="{col}" stroke-width="{width}"{da} marker-end="url(#bk)"/>')
+
+        # ---------- (a) cascade
+        text(20, 26, "(a) Cascade control: AIC-101 (master) sets the setpoint of FIC-101 (slave)", 13, "start", weight="600")
+        y = 95
+        text(30, y - 8, "SP", 10, col=ink2)
+        arrow([(20, y), (61, y)])
+        junction(70, y, [(-14, -6, "+"), (6, 22, "−")])
+        arrow([(79, y), (110, y)])
+        block(110, y - 25, 110, 50, "AIC-101", "master PI (slow)")
+        arrow([(220, y), (281, y)])
+        text(250, y - 8, "S_sp", 10, col=ink2)
+        junction(290, y, [(-14, -6, "+"), (6, 22, "−")])
+        arrow([(299, y), (330, y)])
+        o.append(f'<rect x="275" y="{y - 50}" width="370" height="128" rx="8" fill="none" stroke="{blue}" '
+                 'stroke-width="1.2" stroke-dasharray="6,4"/>')
+        text(460, y - 56, "inner (slave) loop: λ ≈ 12 s", 10, col=blue)
+        block(330, y - 25, 105, 50, "FIC-101", "slave PI (fast)")
+        arrow([(435, y), (470, y)])
+        block(470, y - 25, 90, 50, "Valve", "τ ≈ 6 s")
+        arrow([(560, y), (600, y)])
+        junction(609, y, [(-14, -6, "+"), (-4, -14, "+")])
+        arrow([(609, y - 60), (609, y - 9)], col=orange)
+        text(609, y - 66, "supply pressure (d₂)", 10, col=orange)
+        arrow([(618, y), (690, y)])
+        text(650, y - 8, "S", 10, col=ink2)
+        block(690, y - 25, 160, 50, "Cascade plant", "τ ≈ 7 h, 80 states")
+        arrow([(770, y - 60), (770, y - 25)], col=orange)
+        text(770, y - 66, "feed, pH, scrub (d₁)", 10, col=orange)
+        arrow([(850, y), (1060, y)])
+        text(1000, y - 8, "raffinate heavy share", 10, col=ink2)
+        # inner feedback: flow transmitter
+        arrow([(650, y), (650, y + 55), (290, y + 55), (290, y + 9)], col=blue)
+        text(470, y + 50, "FT-101 flow measurement (fast)", 10, col=blue)
+        # outer feedback: analyzer with dead time
+        block(820, y + 75, 150, 40, "AT-101", "analyzer, dead time θ")
+        arrow([(1000, y), (1000, y + 95), (970, y + 95)])
+        arrow([(820, y + 95), (70, y + 95), (70, y + 9)])
+        text(450, y + 110, "composition feedback (slow, delayed)", 10, col=ink2)
+
+        # ---------- (b) split range
+        y2 = 335
+        text(20, 256, "(b) Split-range control: one output of pHIC-201 drives two valves", 13, "start", weight="600")
+        text(30, y2 - 8, "pH SP", 10, col=ink2)
+        arrow([(20, y2), (61, y2)])
+        junction(70, y2, [(-14, -6, "+"), (6, 22, "−")])
+        arrow([(79, y2), (110, y2)])
+        block(110, y2 - 25, 110, 50, "pHIC-201", "PI")
+        arrow([(220, y2), (260, y2)])
+        text(240, y2 - 8, "u", 10, col=ink2)
+        block(260, y2 - 30, 120, 60, "FY-201", "split-range relay")
+        arrow([(380, y2 - 15), (420, y2 - 15), (420, y2 - 45), (450, y2 - 45)])
+        arrow([(380, y2 + 15), (420, y2 + 15), (420, y2 + 45), (450, y2 + 45)])
+        block(450, y2 - 67, 150, 44, "FV-201A acid", "u 0→50 %: 100→0 %", col=orange)
+        block(450, y2 + 23, 150, 44, "FV-201B alkali", "u 50→100 %: 0→100 %", col=blue)
+        arrow([(600, y2 - 45), (650, y2 - 45), (650, y2 - 9)])
+        arrow([(600, y2 + 45), (650, y2 + 45), (650, y2 + 9)])
+        junction(650, y2, [(-16, -8, "+"), (-16, 22, "−"), (-4, -14, "")])
+        arrow([(690, y2 - 60), (690, y2 - 30), (659, y2 - 3)], col=orange)
+        text(690, y2 - 66, "feed acidity (d)", 10, col=orange)
+        arrow([(659, y2), (700, y2)])
+        text(680, y2 + 22, "net acid", 9, col=ink2)
+        block(700, y2 - 25, 150, 50, "Acidity balance", "τ = V/L ≈ 110 min")
+        arrow([(850, y2), (880, y2)])
+        block(880, y2 - 25, 110, 50, "Titration", "pH = f(net acid)")
+        arrow([(990, y2), (1060, y2)])
+        text(1030, y2 - 8, "pH", 10, col=ink2)
+        arrow([(1020, y2), (1020, y2 + 95), (70, y2 + 95), (70, y2 + 9)])
+        text(560, y2 + 110, "pH electrode (lag ≈ 30 s)", 10, col=ink2)
+        o.append("</svg>")
+        return "".join(o)
+
+    return (control_blocks_svg,)
 
 
 @app.cell
@@ -1216,6 +1582,9 @@ def _(np):
         auto, ff = mode != "MAN", mode == "AUTO+FF"
 
         # ---- section brackets and pH controllers
+        flow_mode = ctrl.get("flow_mode", "ideal")
+        ph_mode = ctrl.get("ph_mode", "ideal")
+        ph_live = ph_mode != "ideal"
         for lo_n, hi_n, name, ph, tag in ((1, f, "Extraction", plant["pH_ext"], "pHIC-201"),
                                           (f + 1, N, "Scrub", plant["pH_scr"], "pHIC-202")):
             if hi_n < lo_n:
@@ -1223,14 +1592,55 @@ def _(np):
             xa, xb = cx(lo_n) - bw / 2, cx(hi_n) + bw / 2
             out.append(f'<path d="M{xa},{top - 22} L{xa},{top - 30} L{xb},{top - 30} L{xb},{top - 22}" '
                        f'fill="none" stroke="#52514e" stroke-width="1"/>')
-            out.append(f'<text x="{(xa + xb) / 2}" y="{top - 36}" font-size="11" text-anchor="middle" fill="#0b0b0b">'
-                       f'{name} section · stages {lo_n}–{hi_n} · pH {ph:.2f}</text>')
-            # bubble at the outer end of the bracket, clear of the centred title and the feed line
-            bx = xa + 22 if name == "Extraction" else xb - 22
-            out.append(_bubble(bx, top - 80, tag, ""))
-            out.append(f'<text x="{bx + (24 if name == "Extraction" else -24)}" y="{top - 84}" font-size="9" '
-                       f'text-anchor="{"start" if name == "Extraction" else "end"}" fill="#52514e">acid/alkali dosing (ideal)</text>')
-            out.append(_signal([(bx, top - 61), (bx, top - 30)]))
+            if name == "Extraction":
+                ph_txt = (f"pH {ctrl.get('ph', ph):.2f} (SP {ph:.2f})" if ph_live else f"pH {ph:.2f}")
+                # left-aligned title; the dosing lines enter just left of the feed line
+                out.append(f'<text x="{xa + 4}" y="{top - 36}" font-size="11" text-anchor="start" fill="#0b0b0b">'
+                           f'Extraction · stages {lo_n}–{hi_n} · {_esc(ph_txt)}</text>')
+                bx = xa + 22
+                out.append(_bubble(bx, top - 80, tag, "", active=ph_mode == "split"))
+                # split-range relay FY-201 and the two dosing valves
+                fx = bx + 50
+                x_ac = max(cx(f) - 58, bx + 96)
+                x_al = x_ac + 34
+                out.append(_bubble(fx, top - 80, "FY-201", "", active=ph_mode == "split", r=16))
+                out.append(_signal([(bx + 19, top - 80), (fx - 16, top - 80)], active=ph_mode == "split"))
+                acid, alk = ctrl.get("acid", 0.0), ctrl.get("alk", 0.0)
+                for xv, reag, pct, side in ((x_ac, "HCl", acid, "A"), (x_al, "NaOH", alk, "B")):
+                    on = ph_live and pct > 0.05
+                    col = "#0b0b0b" if ph_live else "#b5b3ad"
+                    # start below FT-102 (whose bubble ends at y = 81)
+                    out.append(f'<line x1="{xv}" y1="100" x2="{xv}" y2="{top - 31}" stroke="{col}" '
+                               f'stroke-width="{2 if on else 1.2}" marker-end="url(#ah)"/>')
+                    out.append(f'<text x="{xv}" y="96" font-size="9" text-anchor="middle" fill="{col}">{reag}</text>')
+                    out.append(f'<path d="M{xv - 6},{top - 87} L{xv + 6},{top - 73} L{xv - 6},{top - 73} L{xv + 6},{top - 87} Z" '
+                               f'fill="#ffffff" stroke="{col}" stroke-width="1.3"/>')
+                    if ph_live:   # acid label left of its line, alkali label right of its line
+                        out.append(f'<text x="{xv - 6 if side == "A" else xv + 6}" y="{top - 89}" font-size="8" '
+                                   f'text-anchor="{"end" if side == "A" else "start"}" fill="{col}">'
+                                   f'FV-201{side} {pct:.0f} %</text>')
+                out.append(_signal([(fx + 16, top - 80), (x_ac - 6, top - 80)], active=ph_mode == "split"))
+                out.append(_signal([(fx, top - 64), (fx, top - 58), (x_al + 12, top - 58), (x_al + 12, top - 80),
+                                    (x_al + 6, top - 80)], active=ph_mode == "split"))
+                if ph_mode == "split":
+                    lab = [f"pH {ctrl.get('ph', ph):.2f} · SP {ph:.2f}",
+                           f"out {ctrl.get('u_ph', 50):.0f} % → {'acid' if ctrl.get('u_ph', 50) < 50 else 'alkali'}",
+                           "split range: 0–50 % acid, 50–100 % alkali"]
+                elif ph_mode == "manual":
+                    lab = [f"pH {ctrl.get('ph', ph):.2f} · SP {ph:.2f}", "MANUAL: valves fixed"]
+                else:
+                    lab = ["pH ideal (fixed)", "split-range loop not simulated"]
+                for i_, t_ in enumerate(lab):
+                    out.append(f'<text x="{bx - 24}" y="{top - 96 + 11 * i_}" font-size="8.5" text-anchor="end" '
+                               f'fill="#52514e">{_esc(t_)}</text>')
+            else:
+                out.append(f'<text x="{(xa + xb) / 2}" y="{top - 36}" font-size="11" text-anchor="middle" fill="#0b0b0b">'
+                           f'{name} section · stages {lo_n}–{hi_n} · pH {ph:.2f}</text>')
+                bx = xb - 22
+                out.append(_bubble(bx, top - 80, tag, ""))
+                out.append(f'<text x="{bx - 24}" y="{top - 84}" font-size="9" text-anchor="end" '
+                           f'fill="#52514e">acid/alkali dosing (ideal)</text>')
+                out.append(_signal([(bx, top - 61), (bx, top - 30)]))
 
         # ---- stages
         tr = trend if trend is not None else np.zeros(N, int)
@@ -1282,8 +1692,18 @@ def _(np):
         out.append(f'<line x1="20" y1="{yo}" x2="{cx(1) - bw / 2}" y2="{yo}" stroke="#0b0b0b" stroke-width="2" marker-end="url(#ah)"/>')
         out.append(f'<text x="20" y="{yo - 8}" font-size="11" fill="#0b0b0b">Fresh solvent S</text>')
         out.append(_valve(120, yo))
-        out.append(_bubble(120, yo - 62, "FIC-101", f"S = {flows['S']:.2f} L/min", sub_at=(120, yo + 20)))
-        out.append(_signal([(120, yo - 43), (120, yo - 6)]))
+        fic_on = flow_mode != "single"
+        out.append(_bubble(120, yo - 62, "FIC-101", "", active=fic_on))
+        out.append(_signal([(120, yo - 43), (120, yo - 26 if not fic_on else yo - 6)], active=fic_on))
+        s_sp = ctrl.get("S_sp", flows["S"])
+        fl1 = f"S = {flows['S']:.2f} L/min · SP {s_sp:.2f}"
+        fl2 = {"cascade": "CASCADE: AIC-101 sets FIC-101 SP",
+               "single": "SINGLE LOOP: AIC-101 drives valve",
+               "ideal": "flow loop ideal (S = SP)"}[flow_mode]
+        fl3 = f"valve {ctrl.get('valve', 50.0):.1f} %" + (f" · supply {100 * ctrl['supply']:.0f} %"
+                                                          if ctrl.get("supply", 1.0) != 1.0 else "")
+        for i_, t_ in enumerate((fl1, fl3, fl2)):
+            out.append(f'<text x="24" y="{yo + 20 + 11 * i_}" font-size="8.5" fill="#52514e">{_esc(t_)}</text>')
         # ratio feedforward FT-102 -> FY-102 (x) -> FIC-101 setpoint
         out.append(_bubble(45, 62, "FY-102", "S/F ratio", active=ff, sub_at=(68, 94), anchor="start"))
         out.append(_signal([(xf - 69, 62), (64, 62)], active=ff))
@@ -1302,7 +1722,11 @@ def _(np):
         out.append(f'<text x="20" y="{ya + 198}" font-size="9" fill="{"#0b0b0b" if auto else "#b4521f"}" '
                    f'font-weight="600">{_esc({"MAN": "MANUAL (loop open)", "AUTO": "AUTO (PI)", "AUTO-P": "AUTO (P only)", "AUTO+FF": "AUTO (PI) + ratio FF"}.get(mode, mode))}</text>')
         out.append(_signal([(140, ya + 88), (140, ya + 150), (89, ya + 150)]))
-        out.append(_signal([(51, ya + 150), (12, ya + 150), (12, yo - 85), (101, yo - 70)], active=auto))
+        if flow_mode == "single":   # master output bypasses FIC-101 and goes straight to the valve
+            out.append(_signal([(51, ya + 150), (12, ya + 150), (12, yo - 24), (120, yo - 24), (120, yo - 7)],
+                               active=auto))
+        else:                       # cascade: master output is the slave's setpoint
+            out.append(_signal([(51, ya + 150), (12, ya + 150), (12, yo - 85), (101, yo - 70)], active=auto))
 
         # ---- extract outlet (right, organic level) and scrub inlet with FIC-103
         xr = cx(N) + bw / 2
@@ -1401,8 +1825,9 @@ can reproduce every figure on page 2.
 | 7 · Start-up dynamics | B3, B4, B7, B8 |
 | 8 · Step test, process model and tuning rules | B4, B9, B12 |
 | 9 · Frequency response and stability margins | B11 |
-| 10 · Disturbance rejection: P, PI and feedforward | B10, B13, B15, B16 |
+| 10 · Disturbance rejection: P, PI and feedforward | B10, B13, B13.1, B13.2, B15, B16 |
 | 11 · Interactive P&ID | B2, B13, B14 (reading the P&ID), B8, B15 |
+| 12 · Cascade and split-range control | B13.1, B13.2 |
 | (background for all of Part B) | B1, B2, B14, B17 |
 """
     )
@@ -2208,8 +2633,8 @@ The lab's mode **PI + feedforward ratio (S/F)** sets $S = S_0\,F/F_0$ instantly,
 
 **Cascade control.** The composition controller (master, slow) does not drive the pump directly. It sends a setpoint to
 a **flow controller** (slave, fast) on the solvent line, and the slave rejects pump and pressure upsets within seconds,
-before they reach the composition. The lab assumes an ideal slave: S equals its setpoint instantly. A cascade
-works when the inner loop is several times faster than the outer one.
+before they reach the composition. **Split-range control** lets one controller drive two valves, for example acid and
+alkali. Both are developed in full in B13.1 and B13.2 below.
 
 **Multivariable control.** The plant has two products (raffinate and extract purity) and several possible MVs (S, W,
 extraction pH, scrub pH). Each MV affects both products: this is **interaction**. Lab 10 shows it. Holding the raffinate
@@ -2231,13 +2656,140 @@ and absorbance.
 example to keep organic loading below $Q$. **Gain scheduling** changes controller gains with the operating point to
 handle nonlinearity.
 
+"""
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(PAGES, control_blocks_svg, mo, nav):
+    mo.stop(nav.value != PAGES[0])
+    mo.vstack([
+        mo.md(r"""
+#### B13.1 · Cascade control in depth  → *Labs 10, 11, 12a*
+**The problem it solves.** Some disturbances enter close to the manipulated variable, not in the process. A drop in
+solvent supply pressure, a worn pump or a sticking valve changes the solvent flow S immediately. A single composition loop
+cannot see this until the extra metal has worked its way through the cascade and the analyzer: hours of off-spec
+product for an upset that a flow meter detects in seconds.
+
+**The structure (Figure B1a).** Two controllers and two measurements work one final control element:
+
+* the **primary or master** controller AIC-101 measures the primary CV (raffinate composition) and computes a
+  **setpoint for the secondary loop** instead of a valve position;
+* the **secondary or slave** controller FIC-101 measures the secondary variable (solvent flow) and moves the valve.
+
+**Analysis of the inner loop.** The valve and pump respond as $G_v(s) = K_v/(\tau_v s + 1)$: here
+$K_v = S_0/50$ L/min per % and $\tau_v$ = 6 s. With IMC tuning, $K_{c2} = \tau_v/(K_v\lambda)$ and $T_{i2} = \tau_v$.
+The PI zero cancels the valve pole:
+
+$$L_2(s) = K_{c2}\frac{T_{i2}s + 1}{T_{i2}s}\cdot\frac{K_v}{\tau_v s + 1} = \frac{1}{\lambda s}
+\quad\Rightarrow\quad \frac{S}{S_{sp}} = \frac{1}{\lambda s + 1}$$
+
+So the master no longer sees a valve with uncertain gain. It sees a clean first-order lag of $\lambda$ = 12 s and unit gain.
+A disturbance $d_2$ entering inside the inner loop (supply pressure scales $K_v$) reaches S through the sensitivity
+function $1/(1 + L_2) = \lambda s/(\lambda s + 1)$. That is zero at steady state, and it dies out with time constant $\lambda$.
+
+> **Worked example (Lab 12a, supply pressure −15 %).** *Cascade:* the flow dips to 2.57 L/min, is back within 1 % of
+> 2.90 L/min after 39 s, and FIC-101 opens the valve from 50 % to 50/0.85 = **58.8 %**. The raffinate composition
+> barely moves (peak 0.004 points). *Single loop:* AIC-101's output is read as a valve position, so S falls to 2.47 L/min
+> and stays there until the composition loop reacts through the 24-min dead time and 7-h plant: peak **2.08 points**
+> after 3.7 h, IAE 15.4 point·h.
+
+**Design rules.**
+1. The secondary measurement must respond to the disturbances you want to reject, and before the primary does.
+2. The inner loop must be much faster than the outer loop: at least 3–5 times, preferably about 10 times. Here the ratio
+   is about 2,000 (12 s against 7 h). That is why switching from an ideal flow loop to a real cascade changes none of the
+   section 10 results (a test on page 3 checks this).
+3. **Tune from the inside out.** Tune the slave first, then put it in cascade mode and tune the master. The master's model
+   now includes the closed inner loop.
+4. The slave often needs only P action, because the master's integral removes any offset. A PI slave is used here so that
+   S tracks its setpoint exactly.
+
+**Operating practice.** The slave has three modes: manual, automatic (local setpoint) and **cascade** (remote setpoint
+from the master). When the slave is not in cascade, the master must **track** the slave's setpoint, so that switching
+back is bumpless. When the slave's valve saturates, the master must stop integrating ("external reset" or conditional
+integration based on the slave's status), or the master winds up. The lab's ±50 % limit on AIC-101's output is the
+slave's setpoint range. Other cascades in SX plants: settler interface level → aqueous outflow (FIC), pH → reagent
+flow (FIC on each dosing line), mixer temperature → steam or cooling-water flow.
+
+#### B13.2 · Split-range control  → *Labs 10, 11, 12b*
+**The problem it solves.** Sometimes one controller must act through **two final control elements**. This happens when the
+process needs opposite actions (heat or cool, acid or alkali, fill or vent), or when one valve cannot cover the whole
+range (a small valve for low flows, then a large one). **Split-range control** sends a single controller output to a
+**split-range relay** that maps different parts of the output range onto different valves (Figure B1b).
+
+**Why the extraction section needs it.** The extraction pH must stay at its setpoint while the acidity of the feed
+varies. Normally the feed is *more* acidic than the setpoint, so **alkali** must be added: this is saponification, as in A1.10.
+If the feed becomes *less* acidic than the setpoint, the same controller must switch to adding **acid**. pHIC-201's
+output $u$ is split by FY-201:
+
+$$\text{acid valve (FV-201A)} = \max\!\big(0,\ 2\,(50 - u)\big)\ \%,\qquad
+\text{alkali valve (FV-201B)} = \max\!\big(0,\ 2\,(u - 50)\big)\ \%$$
+
+At $u$ = 50 % both valves are shut. Moving the output down opens the acid valve and moving it up opens the alkali valve, so
+the controller always acts in the same direction: a higher output means more alkali and a higher pH.
+
+**Design issues.**
+* **Gap or overlap at the split.** A *gap* (dead band) gives a range of $u$ in which nothing happens, so the loop
+  sticks and limit-cycles. An *overlap* opens both valves at once, so the reagents neutralise each other and are wasted.
+  The lab uses neither.
+* **Gain matching.** The process gain on each side is (valve capacity × reagent strength) per % output. Here both
+  reagents are 1 mol/L and both valves pass 0.05 L/min at 100 %, so the gain is the same on both sides. If the acid were
+  3 mol/L, the acid side would have three times the gain: a controller tuned for the alkali side would oscillate after
+  crossing the split. The fix is to size the ranges unequally, or to use a different gain on each side.
+* **Valve behaviour near closed.** Stiction and poor resolution at small openings are worst exactly at the split, where
+  each valve is nearly shut.
+
+**The pH process model.** The aqueous hold-up of the extraction section (V ≈ 160 L) is lumped into one well-mixed volume.
+Its **net acid** $a$ (mol/L, negative = excess base) follows
+
+$$V\frac{da}{dt} = L\,(h_{in} - a) + c\,(q_{acid} - q_{alk}),\qquad
+[\mathrm{H^+}] = \frac{a + \sqrt{a^2 + 4K_w}}{2},\quad \mathrm{pH} = -\log_{10}[\mathrm{H^+}]$$
+
+where $h_{in}$ is the acidity of the scrub liquor and feed entering extraction. The pH from the charge balance is the
+**titration curve**. While $a \gg 10^{-7}$ the pH is $-\log_{10}a$, but as $a$ passes through zero the pH jumps by
+several units.
+
+* **Steady output:** $u_0 = 50 + 50\,L\,(h_{in} - h_{sp})/(q_{max}c)$, which is 63.9 % at the defaults (alkali valve 27.8 %).
+* **Linearised gain:** $K_p = \dfrac{d\,\mathrm{pH}}{du} = \dfrac{2q_{max}c/100}{L\,h\ln 10} = 0.0238$ pH per %, and
+  $\tau = V/L$ = 110 min. The gain is inversely proportional to $[\mathrm{H^+}]$: at pH 3.9 it would be 100 times larger.
+  That is the classic **pH nonlinearity** that makes many pH loops need gain scheduling.
+* **Tuning (lambda):** $K_c = LG/K_p$, $T_i = \tau$. With LG = 4, $K_c$ = 168 % per pH unit, $T_i$ = 110 min, and the
+  closed-loop time constant is about $\tau/LG$ ≈ 28 min.
+
+> **Worked example (Lab 12b).**
+> * **Feed acidity −80 %:** the feed now brings less acid than the setpoint needs. pHIC-201 moves from 63.9 % (alkali) down
+>   through the split to **43.9 % (acid valve 12.2 %)**. The pH deviates at most 0.08, and the composition loop sees a peak
+>   of 4.6 points. With the valves in **manual**, the alkali keeps flowing, the net acid passes zero and the pH runs up the
+>   titration curve to about **11**. The lab flags this as outside the model; a real plant would precipitate rare-earth
+>   hydroxides and form crud.
+> * **Feed acidity +50 %:** the output rises to 76.4 % (alkali 52.8 %), and the pH deviates at most 0.05. In manual the pH
+>   settles at 1.67 and the raffinate CV is off by 25 points.
+
+**pH control as a protective inner layer.** Every extraction-stage $D$ changes by a factor of $10^{3\Delta\mathrm{pH}}$. A
+good pH loop therefore removes acidity disturbances before they reach the composition loop. The "Extraction pH −0.05"
+upset, when modelled as extra feed acid, gives a composition peak of 4.4 points with manual valves but only
+**0.57 points** with split-range control. The flip side: with a *dynamic* pH, a +20 % feed step also brings extra acid,
+and the composition peak becomes 2.45 points instead of 1.83. The fixed-pH assumption of sections 5–9 was optimistic.
+"""),
+        mo.Html(control_blocks_svg()),
+        mo.md("*Figure B1. Block diagrams of the two inner-loop strategies used in Labs 10–12. Orange arrows are "
+              "disturbances; blue marks the fast inner loop.*"),
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(PAGES, mo, nav):
+    mo.stop(nav.value != PAGES[0])
+    mo.md(
+        r"""
 ### B14 · Instrumentation and control of real SX plants
 * **Flow control on every stream.** Magnetic or Coriolis flow meters with pump speed control (FIC) on feed, solvent,
   scrub and strip. O/A ratio controllers tie solvent to feed.
-* **Acidity.** pH is a strongly nonlinear variable: the titration curve is steep near neutrality. Electrodes also foul in
+* **Acidity.** (Split-range pH control is developed in B13.2.) pH is a strongly nonlinear variable: the titration curve is steep near neutrality. Electrodes also foul in
   organic-contaminated streams. Plants often control the **saponification degree** (alkali flow in ratio to solvent flow) and the
-  acid strength of scrub and strip liquors instead of measuring pH in every stage. The lab's fixed pH per stage idealises
-  this layer.
+  acid strength of scrub and In *Ideal pH* mode the lab's fixed pH per stage idealises this layer. In *Split-range* or *Manual* mode the extraction pH is dynamic (B13.2).
 * **Settler interface level.** This is an integrating variable, controlled by adjustable weirs or by the aqueous
   outflow. Losing it sends one phase out with the other.
 * **Mixer phase continuity**, held by internal recycle, and **temperature**, because $D$ and phase separation both depend
@@ -2265,15 +2817,22 @@ and control loop. Its conventions follow ISA-5.1:
 **Loops drawn in Lab 11:**
 
 * **FIC-101 (solvent flow)** is the fast inner loop. It holds S at its setpoint by adjusting the solvent valve or pump.
+  Its readout shows the flow, the setpoint coming from AIC-101, the valve opening and (during a supply upset) the
+  supply pressure.
 * **AT-101 → AIC-101 → FIC-101** is the composition loop. The analyzer on the raffinate (with its dead time) feeds the
-  PI controller, whose output is the **setpoint** of FIC-101. This is **cascade control** (B13). In *MANUAL* the AIC is
-  greyed and S stays fixed, which is how start-up and the open-loop disturbance are run.
+  PI controller, whose output is the **setpoint** of FIC-101. This is **cascade control** (B13.1). In *single-loop*
+  mode, FIC-101 is greyed and AIC-101's signal bypasses it straight to the valve. In *MANUAL* the AIC is greyed and its
+  output stays fixed, which is how start-up and the open-loop disturbance are run.
 * **FT-102 → FY-102 → FIC-101** is the feed-ratio feedforward. FY-102 multiplies the measured feed flow by the S/F ratio.
   It is active (black) only in the "PI + feedforward ratio" mode.
 * **FIC-103** holds the scrub flow W. In the "Scrub flow −20 %" disturbance it is the scrub flow itself that is
   stepped, as if this loop's setpoint had been changed wrongly.
-* **pHIC-201/202** hold the acidity of the extraction and scrub sections. **LIC** loops (one per settler, drawn once)
-  hold each interface level. The lab treats both as perfect (B14, B17).
+* **pHIC-201 → FY-201 → FV-201A (HCl) / FV-201B (NaOH)** is the **split-range** pH loop of the extraction section
+  (B13.2). The readout shows the live pH, the controller output and which side of the split it is on, and each valve's
+  opening. It is greyed in *Ideal pH* mode (fixed pH, as in sections 5–9). In *Manual*, the valves stay at their initial
+  openings.
+* **pHIC-202** holds the scrub acidity, and **LIC** loops (one per settler, drawn once) hold each interface level.
+  The lab treats both as perfect (B14, B17).
 
 **The stage symbols are live.** Each stage is drawn as a settler with its organic layer on top and its aqueous layer
 below. The bars show the light and heavy element concentrations leaving that stage. Change nExt or nScr in section 5 and the
@@ -2282,7 +2841,8 @@ During start-up (B8) the arrows show the profile filling outward from the feed s
 the upset travelling through the cascade, and in closed loop the controller pulling it back.
 
 ### B15 · The disturbances in this lab  → *Lab 10*
-Each is applied as a step at $t = 0$ from steady state.
+Each is applied as a step at $t = 0$ from steady state. The last three act through the inner loops and need the
+*Cascade/Single loop* or *Split-range/Manual* options in Lab 10; in *Ideal* modes they have no effect.
 
 | Disturbance | Physical effect | Open loop (Pr|Nd) | Can feedforward help? |
 |---|---|---|---|
@@ -2290,6 +2850,9 @@ Each is applied as a step at $t = 0$ from steady state.
 | **Feed composition 50:50 → 60:40** | More heavy element at the same flows | → about 29.5 % | Only with a feed analyzer |
 | **Extraction pH −0.05** | $D$ falls by $10^{0.15} \approx 1.41$ in every extraction stage | → about 37 %, the largest upset | Better acidity control is the real fix |
 | **Scrub flow −20 %** | Less wash liquor, so less metal is returned from the organic | Raffinate *cleaner* (about 18 %), extract dirtier | The scrub flow controller should prevent it |
+| **Solvent supply pressure −15 %** | Valve passes 15 % less solvent for the same opening | Cascade: none (FIC-101 reopens the valve in under a minute). Single loop: CV peak 2.1 points | Rejected by **cascade** control (B13.1) |
+| **Feed acidity +50 %** | More acid enters extraction; pH falls unless more alkali is added | Split range: pH −0.05 at worst. Manual valves: pH 1.67, CV off by 25 points | Rejected by the **split-range** pH loop (B13.2) |
+| **Feed acidity −80 %** | Feed brings less acid than the setpoint needs; the controller must switch to acid | Split range crosses to acid (output 64 % → 44 %). Manual valves: pH runs to about 11 | Only split-range control can do both directions |
 
 The last row shows why a single CV can mislead: the controlled raffinate improves while the uncontrolled extract
 degrades.
@@ -2312,7 +2875,12 @@ degrades.
   settlers, and phase volumes stay fixed at the nominal split.
 * $\tau_{mt}$ = 12 s, the 8 L mixer and 40 L settler, the ±50 % MV limit and the analyzer (a pure dead time, continuous,
   noise-free) are **teaching estimates**.
-* The flow slave loop is ideal, feedforward is static, and the controller acts every 2‑min integration step.
+* The composition controller acts once per 2‑min integration step (5 min in Lab 12). Feedforward is static.
+* The flow loop is either ideal or a PI cascade on a first-order valve (6 s) with linear characteristic. The supply upset
+  scales the valve gain.
+* The extraction pH is either fixed (ideal) or one lumped strong-acid/strong-base balance over the extraction-section
+  aqueous (no buffering by the extractant, no metal hydrolysis). The pH used in $D$ is clamped to ±1 of setpoint, beyond
+  which results are flagged. The pH electrode is a 30 s lag. Inner loops are integrated in 3‑s sub-steps.
 * The process gain comes from steady-state perturbation and the FOPDT model from Smith's method. Both approximate a
   nonlinear, 80-state plant. The frequency-response margins are therefore model-based (see B11 for how far they differ).
 * Implicit Euler with 2‑min steps is accurate for the slow dynamics but damps anything faster than a few minutes.
@@ -2383,7 +2951,7 @@ def _(CF_DEFAULT, PAIR_DEFAULTS, dd_pair, mo):
 
 
 @app.cell(hide_code=True)
-def _(CONTROL_MODES, DISTURBANCES, mo):
+def _(CONTROL_MODES, DISTURBANCES, FLOW_MODES, PH_MODES, mo):
     sl_F = mo.ui.slider(0.2, 5.0, 0.1, value=1.0, label="Feed flow F (L/min)", show_value=True, debounce=True)
     sl_Vm = mo.ui.slider(1, 50, 1, value=8, label="Mixer volume (L)", show_value=True, debounce=True)
     sl_Vs = mo.ui.slider(5, 200, 5, value=40, label="Settler volume (L)", show_value=True, debounce=True)
@@ -2395,9 +2963,15 @@ def _(CONTROL_MODES, DISTURBANCES, mo):
     sl_limit = mo.ui.slider(10, 100, 5, value=50, label="Solvent-flow limit (± % of nominal)", show_value=True, debounce=True)
     sl_step = mo.ui.slider(-20, 20, 1, value=5, label="Step in S (% of nominal)", show_value=True, debounce=True)
     dd_mode = mo.ui.dropdown(CONTROL_MODES, value="PI", label="Controller mode")
+    dd_flow = mo.ui.dropdown(list(FLOW_MODES), value=list(FLOW_MODES)[0], label="Solvent-flow structure")
+    dd_ph = mo.ui.dropdown(list(PH_MODES), value=list(PH_MODES)[0], label="Extraction pH control")
+    sl_phLG = mo.ui.slider(0.5, 10, 0.5, value=4.0, label="pHIC-201 loop gain", show_value=True, debounce=True)
     return (
         dd_dist,
+        dd_flow,
         dd_mode,
+        dd_ph,
+        sl_phLG,
         sl_F,
         sl_LG,
         sl_Ti,
@@ -2416,7 +2990,7 @@ def _(PAGES, mo, nav):
     mo.md(
         "## 2 · Interactive lab\n"
         "The lab has two halves of equal weight. **Part A, Separations** (sections 1–5) goes from one equilibrium "
-        "contact to a full extraction/scrub cascade. **Part B, Process dynamics and control** (sections 6–11) turns that "
+        "contact to a full extraction/scrub cascade. **Part B, Process dynamics and control** (sections 6–12) turns that "
         "cascade into a mixer-settler plant and controls it. Every chart updates live. Each section has a matching "
         "background chapter on page 1 (Background), and the code is on page 3.\n\n"
         "---\n## Part A · Separations"
@@ -2730,7 +3304,7 @@ def _(PAGES, mo, nav):
     mo.stop(nav.value != PAGES[1])
     mo.md(
         "---\n## Part B · Process dynamics and control\n"
-        "Sections 6–11 build the section 5 cascade as a plant of real mixer-settlers. They use the same pair, stages, "
+        "Sections 6–12 build the section 5 cascade as a plant of real mixer-settlers. They use the same pair, stages, "
         "S and W (scaled by the feed flow F) and pH values. You can then watch the plant fill, find "
         "its step response, tune a PI controller and reject disturbances. The background is in **Part B** of page 1 (Background)."
     )
@@ -3039,16 +3613,35 @@ def _(
 
 # --------------------------------------------------- Section 10: disturbances and control
 @app.cell(hide_code=True)
-def _(dd_dist, plant, simulate_disturbance):
-    open_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=False)
+def _(FLOW_MODES, PH_MODES, dd_dist, dd_flow, dd_ph, plant, simulate_disturbance, sl_phLG):
+    # AIC-101 in manual; the inner loops (FIC-101, pHIC-201) still act as selected
+    open_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=False,
+                                     flow_mode=FLOW_MODES[dd_flow.value], ph_mode=PH_MODES[dd_ph.value],
+                                     ph_LG=sl_phLG.value)
     return (open_loop,)
 
 
 @app.cell(hide_code=True)
-def _(dd_dist, dd_mode, plant, simulate_disturbance, sl_LG, sl_Ti, sl_delay, sl_limit):
+def _(
+    FLOW_MODES,
+    PH_MODES,
+    dd_dist,
+    dd_flow,
+    dd_mode,
+    dd_ph,
+    plant,
+    simulate_disturbance,
+    sl_LG,
+    sl_Ti,
+    sl_delay,
+    sl_limit,
+    sl_phLG,
+):
     closed_loop = simulate_disturbance(plant, dd_dist.value, closed_loop=True, LG=sl_LG.value,
                                        Ti=float(sl_Ti.value), delay=float(sl_delay.value),
-                                       limit=sl_limit.value / 100.0, mode=dd_mode.value)
+                                       limit=sl_limit.value / 100.0, mode=dd_mode.value,
+                                       flow_mode=FLOW_MODES[dd_flow.value], ph_mode=PH_MODES[dd_ph.value],
+                                       ph_LG=sl_phLG.value)
     return (closed_loop,)
 
 
@@ -3059,7 +3652,9 @@ def _(
     INK2,
     closed_loop,
     dd_dist,
+    dd_flow,
     dd_mode,
+    dd_ph,
     label_axes,
     mo,
     new_figure,
@@ -3069,6 +3664,7 @@ def _(
     sl_Ti,
     sl_delay,
     sl_limit,
+    sl_phLG,
 ):
     _tt = open_loop["t"] / 60
     _f, (_a1, _a2, _a3) = new_figure(3, 10.5, 3.3)
@@ -3088,6 +3684,19 @@ def _(
     _lim = sl_limit.value / 100.0
     _a3.axhspan((1 - _lim) * plant["S"], (1 + _lim) * plant["S"], color="#ecebe7", zorder=0)
     _p_offset = (open_loop["final"] - open_loop["sp"]) / (1.0 + sl_LG.value)
+    _msgs = []
+    if closed_loop["supply"] != 1.0 and closed_loop["flow_mode"] == "ideal":
+        _msgs.append("The supply-pressure upset acts on the solvent valve, so it has no effect with an ideal flow loop. "
+                     "Choose *Cascade* or *Single loop*.")
+    if closed_loop["acid_factor"] != 1.0 and closed_loop["ph_mode"] == "ideal" and "acidity" in dd_dist.value:
+        _msgs.append("Feed-acidity upsets act through the extraction pH, which is fixed in *Ideal pH* mode. Choose "
+                     "*Split-range PI* or *Manual*.")
+    if open_loop.get("ph_out_of_range") or closed_loop.get("ph_out_of_range"):
+        _msgs.append(f"The extraction pH left the model's valid range (±1 of setpoint; peak deviation "
+                     f"{max(open_loop['ph_peak'], closed_loop['ph_peak']):.2f}). Beyond it, $D$ is clamped and real "
+                     "plants would see hydroxide precipitation and loss of extraction.")
+    _notes = (mo.callout(mo.md("  \n".join(_msgs)), kind="warn") if _msgs else
+              mo.md("Inner loops: see section 12 for cascade and split-range control in detail."))
     mo.vstack([
         mo.md("### 10 · Disturbance rejection: P, PI and feedforward\n"
               "The grey band on the S chart is the allowed range of the solvent flow."
@@ -3095,6 +3704,8 @@ def _(
                  if dd_mode.value == "P only" else "")),
         mo.hstack([dd_dist, dd_mode, sl_LG], justify="start", gap=1.5, wrap=True),
         mo.hstack([sl_Ti, sl_delay, sl_limit], justify="start", gap=1.5, wrap=True),
+        mo.hstack([dd_flow, dd_ph, sl_phLG], justify="start", gap=1.5, wrap=True),
+        _notes,
         mo.hstack([
             mo.stat(f"{open_loop['sp']:.1f} → {open_loop['final']:.1f} %", label="CV open loop (start → end)", bordered=True),
             mo.stat(f"{open_loop['peak']:.2f} / {closed_loop['peak']:.2f}", label=f"Peak deviation, open / {_lab} (points)", bordered=True),
@@ -3126,10 +3737,15 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(
+    FLOW_MODES,
+    PH_MODES,
     PID_SCENARIOS,
     closed_loop,
+    dd_flow,
     dd_mode,
+    dd_ph,
     dd_pid,
+    inner_init,
     np,
     open_loop,
     plant,
@@ -3168,6 +3784,17 @@ def _(
                        F=_run["F_run"] if k > 0 else plant["F"]) for k in _k]
         _ctrl = [dict(mode=_mode, pv=float(_run["cv"][k]), meas=float(_run["cv"][max(0, k - _run["nd"])]),
                       sp=_run["sp"], delay=sl_delay.value) for k in _k]
+    # inner-loop readings (cascade flow loop and split-range pH loop) for every frame
+    if _sc in PID_SCENARIOS[:2]:
+        _in = inner_init(plant)
+        _inner = dict(flow_mode=FLOW_MODES[dd_flow.value], ph_mode=PH_MODES[dd_ph.value], S_sp=plant["S"],
+                      valve=50.0, ph=plant["pH_ext"], u_ph=_in["u"], acid=_in["acid"], alk=_in["alk"], supply=1.0)
+        _ctrl = [dict(_c, **_inner) for _c in _ctrl]
+    else:
+        _ctrl = [dict(_c, flow_mode=_run["flow_mode"], ph_mode=_run["ph_mode"], S_sp=float(_run["S_sp"][k]),
+                      valve=float(_run["valve"][k]), ph=float(_run["pH"][k]), u_ph=float(_run["u_ph"][k]),
+                      acid=float(_run["acid"][k]), alk=float(_run["alk"][k]),
+                      supply=_run["supply"] if k > 0 else 1.0) for _c, k in zip(_ctrl, _k)]
     pid_data = dict(frames=_frames, t=_t, flows=_flows, ctrl=_ctrl, scenario=_sc,
                     scale_aq=float(np.ceil(_frames[:, :, 2::4].max() / 10) * 10 or 10),
                     scale_org=float(np.ceil(_frames[:, :, 3::4].max() / 10) * 10 or 10))
@@ -3224,12 +3851,234 @@ def _(
               f"The cascade from section 5 ({plant['N']} stages: {plant['n_ext']} extraction + {plant['n_scr']} scrub) "
               "drawn as a piping and instrumentation diagram. Bars show the settler concentrations of each element "
               "in the organic (top) and aqueous (bottom) layer of every stage. **Hover over a stage** for exact "
-              "values. Choose a scenario, then drag the time slider or press **Play**. The disturbance, controller mode and tuning "
-              "come from section 10. Symbols are explained on page 1, B14."),
+              "values. Choose a scenario, then drag the time slider or press **Play**. The disturbance, controller mode, tuning, "
+              "solvent-flow structure (cascade or single loop) and extraction pH control (split range, manual or ideal) "
+              "come from section 10. Symbols are explained on page 1, B14, and the two inner loops in B13."),
         mo.hstack([dd_pid, sw_play, refresher], justify="start", gap=1.5, wrap=True),
         mo.hstack([sl_frame, mo.md(f"t = **{pid_data['t'][_i]:.1f} h** (frame {_i + 1} of {len(pid_data['frames'])})")],
                   justify="start", gap=1.5),
         mo.Html(_svg),
+    ])
+    return
+
+
+# --------------------------------------------------- Section 12: cascade and split-range control
+@app.cell(hide_code=True)
+def _(DISTURBANCES, mo):
+    _names = list(DISTURBANCES)
+    dd_casc = mo.ui.dropdown(_names, value=[n for n in _names if n.startswith("Solvent supply")][0],
+                             label="Disturbance (cascade study)")
+    dd_split = mo.ui.dropdown(_names, value=[n for n in _names if "crosses the split" in n][0],
+                              label="Disturbance (split-range study)")
+    return dd_casc, dd_split
+
+
+@app.cell(hide_code=True)
+def _(
+    PAGES,
+    dd_casc,
+    flow_loop_trace,
+    mo,
+    nav,
+    plant,
+    simulate_disturbance,
+    sl_LG,
+    sl_Ti,
+    sl_delay,
+    sl_limit,
+):
+    mo.stop(nav.value != PAGES[1])
+    # 24 h with 5-min plant steps (inner loops are sub-stepped at 3 s)
+    casc_runs = {fm: simulate_disturbance(plant, dd_casc.value, True, LG=sl_LG.value, Ti=float(sl_Ti.value),
+                                          delay=float(sl_delay.value), limit=sl_limit.value / 100.0,
+                                          flow_mode=fm, ph_mode="ideal", t_end=24 * 60.0, nsteps=288,
+                                          frame_every=10 ** 6)
+                 for fm in ("cascade", "single")}
+    casc_fast = {fm: flow_loop_trace(plant, fm, supply=0.85, t_end=5.0) for fm in ("cascade", "single")}
+    return casc_fast, casc_runs
+
+
+@app.cell(hide_code=True)
+def _(
+    ACCENT1,
+    INK,
+    INK2,
+    LAMBDA_FLOW,
+    TAU_VALVE,
+    casc_fast,
+    casc_runs,
+    dd_casc,
+    label_axes,
+    mo,
+    new_figure,
+    plant,
+):
+    _cols = {"cascade": ACCENT1, "single": INK2}
+    _names = {"cascade": "cascade", "single": "single loop"}
+    # fast view: the inner loop after a supply-pressure drop (master output frozen)
+    _f1, (_a1, _a2) = new_figure(2, 10.0, 3.1)
+    for _fm, (_t, _S, _v) in casc_fast.items():
+        _a1.plot(_t, _S, color=_cols[_fm], lw=2)
+        _a2.plot(_t, _v, color=_cols[_fm], lw=2)
+        _a1.annotate(_names[_fm], (_t[-1], _S[-1]), xytext=(-4, 6 if _fm == "cascade" else -12),
+                     textcoords="offset points", ha="right", fontsize=8, color=INK)
+        _a2.annotate(_names[_fm], (_t[-1], _v[-1]), xytext=(-4, 6 if _fm == "cascade" else -12),
+                     textcoords="offset points", ha="right", fontsize=8, color=INK)
+    _a1.axhline(plant["S"], color=INK2, lw=1, ls=":")
+    label_axes(_a1, "Solvent flow after supply −15 % at t = 0 (dotted = setpoint)", "Time (min)", "L/min")
+    label_axes(_a2, "Solvent valve opening", "Time (min)", "%")
+    # slow view: the composition loop over 24 h
+    _f2, (_b1, _b2) = new_figure(2, 10.0, 3.2)
+    for _fm, _r in casc_runs.items():
+        _th = _r["t"] / 60
+        _b1.plot(_th, _r["cv"], color=_cols[_fm], lw=2)
+        _b2.plot(_th, _r["S"], color=_cols[_fm], lw=2)
+        _b2.plot(_th, _r["S_sp"], color=_cols[_fm], lw=1.2, ls="--")
+        _b1.annotate(_names[_fm], (_th[-1], _r["cv"][-1]), xytext=(-4, 6 if _fm == "single" else -12),
+                     textcoords="offset points", ha="right", fontsize=8, color=INK)
+    _b1.axhline(casc_runs["cascade"]["sp"], color=INK2, lw=1, ls=":")
+    label_axes(_b1, "CV: heavy share in raffinate", "Time (h)", "%")
+    label_axes(_b2, "Solvent flow: actual (solid) and AIC-101 output (dashed)", "Time (h)", "L/min")
+    _rc, _rs = casc_runs["cascade"], casc_runs["single"]
+    _out = mo.vstack([
+        mo.md("### 12 · Cascade and split-range control\n"
+              "Both strategies are inner loops underneath the composition controller AIC-101 (Background, B13). "
+              "The composition loop uses the tuning from section 10."),
+        mo.md("#### 12a · Cascade control of the solvent flow\n"
+              "**Cascade:** AIC-101 (master) sets the setpoint of FIC-101 (slave), which moves the solvent valve. "
+              "**Single loop:** AIC-101 moves the valve directly through its nominal characteristic. "
+              f"FIC-101 is a PI tuned by IMC for a valve lag of {TAU_VALVE * 60:.0f} s and a closed-loop time constant of "
+              f"{LAMBDA_FLOW * 60:.0f} s. That is about {7 * 60 / LAMBDA_FLOW:,.0f} times faster than the plant's 7 h "
+              "time constant."),
+        dd_casc,
+        mo.hstack([
+            mo.stat(f"{_rc['peak']:.2f} / {_rs['peak']:.2f}", label="CV peak, cascade / single (points)", bordered=True),
+            mo.stat(f"{_rc['iae']:.1f} / {_rs['iae']:.1f}", label="IAE, cascade / single (point·h)", bordered=True),
+            mo.stat(f"{_rc['valve'][-1]:.1f} / {_rs['valve'][-1]:.1f} %", label="Final valve, cascade / single", bordered=True),
+        ], widths="equal"),
+        mo.md("**Inner loop, first 5 minutes** (a supply-pressure drop of 15 % with the master output frozen):"),
+        _f1,
+        mo.md(f"**Composition loop over 24 h** for the chosen disturbance ({dd_casc.value}):"),
+        _f2,
+    ])
+    _out
+    return
+
+
+@app.cell(hide_code=True)
+def _(
+    PAGES,
+    dd_split,
+    mo,
+    nav,
+    plant,
+    simulate_disturbance,
+    sl_LG,
+    sl_Ti,
+    sl_delay,
+    sl_limit,
+    sl_phLG,
+):
+    mo.stop(nav.value != PAGES[1])
+    split_runs = {pm: simulate_disturbance(plant, dd_split.value, True, LG=sl_LG.value, Ti=float(sl_Ti.value),
+                                           delay=float(sl_delay.value), limit=sl_limit.value / 100.0,
+                                           flow_mode="cascade", ph_mode=pm, ph_LG=sl_phLG.value,
+                                           t_end=24 * 60.0, nsteps=288, frame_every=10 ** 6)
+                  for pm in ("split", "manual")}
+    return (split_runs,)
+
+
+@app.cell(hide_code=True)
+def _(
+    ACCENT1,
+    ACCENT2,
+    INK,
+    INK2,
+    dd_split,
+    label_axes,
+    mo,
+    new_figure,
+    np,
+    ph_process_model,
+    plant,
+    sl_phLG,
+    split_range,
+    split_runs,
+):
+    _rs, _rm = split_runs["split"], split_runs["manual"]
+    _kp, _tau = ph_process_model(plant)
+    # the split-range map with the operating points
+    _u = np.linspace(0, 100, 201)
+    _ac = np.array([split_range(v)[0] for v in _u])
+    _al = np.array([split_range(v)[1] for v in _u])
+    _f1, (_a0,) = new_figure(1, 5.2, 3.0)
+    _a0.plot(_u, _ac, color=ACCENT2, lw=2)
+    _a0.plot(_u, _al, color=ACCENT1, lw=2)
+    _a0.annotate("acid valve FV-201A", (10, 80), fontsize=8, color=INK)
+    _a0.annotate("alkali valve FV-201B", (62, 80), fontsize=8, color=INK)
+    _a0.axvline(50, color=INK2, lw=1, ls=":")
+    for _val, _lab, _dy in ((_rs["u_ph"][0], "start", 6), (_rs["u_ph"][-1], "end", -14)):
+        _a0.plot([_val], [max(split_range(_val))], "o", ms=7, color=INK, mec="white", mew=1.5)
+        _a0.annotate(f"{_lab} {_val:.0f} %", (_val, max(split_range(_val))), xytext=(6, _dy),
+                     textcoords="offset points", fontsize=8, color=INK)
+    label_axes(_a0, "Split-range map (dotted = split point)", "pHIC-201 output (%)", "Valve opening (%)")
+    # time responses
+    _th = _rs["t"] / 60
+    _f2, (_b1, _b2, _b3) = new_figure(3, 10.5, 3.2)
+    _b1.plot(_th, _rs["pH"], color=ACCENT1, lw=2)
+    _b1.plot(_th, _rm["pH"], color=INK2, lw=2)
+    _b1.axhline(plant["pH_ext"], color=INK2, lw=1, ls=":")
+    _b1.set_ylim(min(_rs["pH"].min(), min(_rm["pH"].min(), plant["pH_ext"] - 0.1)) - 0.02,
+                 min(max(_rs["pH"].max(), _rm["pH"].max(), plant["pH_ext"] + 0.1) + 0.02, plant["pH_ext"] + 1.5))
+    _b1.annotate("split range", (_th[-1], _rs["pH"][-1]), xytext=(-4, -12), textcoords="offset points",
+                 ha="right", fontsize=8, color=INK)
+    _b1.annotate("manual valves", (_th[-1], min(_rm["pH"][-1], plant["pH_ext"] + 1.45)), xytext=(-4, 6),
+                 textcoords="offset points", ha="right", fontsize=8, color=INK)
+    label_axes(_b1, "Extraction pH (dotted = setpoint)", "Time (h)", "pH")
+    _b2.plot(_th, _rs["u_ph"], color=INK, lw=2, label="controller output")
+    _b2.plot(_th, _rs["acid"], color=ACCENT2, lw=1.6, label="acid valve")
+    _b2.plot(_th, _rs["alk"], color=ACCENT1, lw=1.6, label="alkali valve")
+    _b2.axhline(50, color=INK2, lw=1, ls=":")
+    _b2.legend(frameon=False, fontsize=7, loc="best")
+    _b2.set_ylim(0, 100)
+    label_axes(_b2, "pHIC-201 output and valves (split range)", "Time (h)", "%")
+    _b3.plot(_th, _rs["cv"], color=ACCENT1, lw=2)
+    _b3.plot(_th, _rm["cv"], color=INK2, lw=2)
+    _b3.axhline(_rs["sp"], color=INK2, lw=1, ls=":")
+    _up = _rm["cv"][-1] >= _rs["cv"][-1]
+    _b3.annotate("split range", (_th[-1], _rs["cv"][-1]), xytext=(-4, -12 if _up else 6), textcoords="offset points",
+                 ha="right", fontsize=8, color=INK)
+    _b3.annotate("manual valves", (_th[-1], _rm["cv"][-1]), xytext=(-4, 6 if _up else -12), textcoords="offset points",
+                 ha="right", fontsize=8, color=INK)
+    label_axes(_b3, "CV: heavy share in raffinate (AIC-101 in auto)", "Time (h)", "%")
+    _crossed = (_rs["u_ph"][0] - 50) * (_rs["u_ph"][-1] - 50) < 0
+    _warn = ([mo.callout(mo.md(f"With the valves in manual the pH reached **{_rm['pH'].max():.1f}**, outside the model's "
+                               "valid range. The net acid passed through zero: the steep part of the titration curve "
+                               "(Background, B13)."), kind="warn")]
+             if _rm["ph_out_of_range"] else [])
+    mo.vstack([
+        mo.md("#### 12b · Split-range control of the extraction pH\n"
+              "One controller, pHIC-201, drives two valves through the split-range relay FY-201. Below 50 % output it "
+              "opens the **acid** valve, and above 50 % the **alkali** (saponification) valve. The extraction section's "
+              "aqueous hold-up is lumped into one acidity balance, so pH now changes with time and moves every "
+              "extraction-stage $D$. Compared with **manual**, where both valves stay at their initial openings."),
+        mo.hstack([dd_split, sl_phLG], justify="start", gap=1.5, wrap=True),
+        mo.hstack([
+            mo.stat(f"{_kp:.4f} pH/% · {_tau:.0f} min", label="pH process: Kp · τ = V/L", bordered=True),
+            mo.stat(f"{sl_phLG.value / _kp:.0f} %/pH · {_tau:.0f} min", label="pHIC-201: Kc · Ti", bordered=True),
+            mo.stat(f"{_rs['u_ph'][0]:.1f} → {_rs['u_ph'][-1]:.1f} %", label="Output start → end"
+                    + (" (crossed the split)" if _crossed else ""), bordered=True),
+            mo.stat(f"{_rs['ph_peak']:.3f} / {_rm['ph_peak']:.2f}", label="pH peak deviation, split / manual", bordered=True),
+            mo.stat(f"{_rs['peak']:.2f} / {_rm['peak']:.2f}", label="CV peak, split / manual (points)", bordered=True),
+        ], widths="equal"),
+        *_warn,
+        mo.hstack([_f1, mo.md(
+            f"**Reading the map.** At the start the feed is more acidic than the setpoint, so alkali is needed: "
+            f"output {_rs['u_ph'][0]:.0f} %, alkali valve {_rs['alk'][0]:.0f} %. "
+            f"After *{dd_split.value}* the controller settles at {_rs['u_ph'][-1]:.0f} % "
+            f"(acid {_rs['acid'][-1]:.0f} %, alkali {_rs['alk'][-1]:.0f} %). At exactly 50 % both valves are shut, "
+            "so the two reagents never fight each other.")], widths=[1, 1]),
+        _f2,
     ])
     return
 
@@ -3243,6 +4092,8 @@ def _(
     assemble,
     band_lu,
     cascade_steady,
+    control_blocks_svg,
+    inner_advance,
     inspect,
     linecache,
     log10_D,
@@ -3277,8 +4128,10 @@ def _(
         ("Mixer-settler dynamics, efficiency sweep and start-up (implicit Euler)", assemble),
         ("Step test, FOPDT fit, SIMC tuning, P/PI/feedforward control and disturbances", simulate_disturbance),
         ("Frequency response, stability margins and PI tuning rules", stability_margins),
+        ("Inner loops: cascade flow control and split-range pH control", inner_advance),
         ("Interactive P&ID drawing (SVG)", pid_svg),
         ("Mixer-settler connection diagrams (Figure A1)", mixer_settler_detail_svg),
+        ("Cascade and split-range block diagrams (Figure B1)", control_blocks_svg),
         ("Tests", run_tests),
         ("Plotting helpers", new_figure),
     ]
@@ -3402,6 +4255,13 @@ conditions. Published β for Ce/La range from about 4 to above 50 depending on t
   numbers are invented. Frames are stored every 30 min of simulated time (every 15 integration steps). Bars show the
   settler outlet concentrations, and ▲/▼ mark stages whose settler metal changes by more than 2 % per hour. Play uses
   marimo's refresh timer. The pH and level loops are drawn but treated as ideal.
+* **Cascade and split-range control (Labs 10–12, Background B13.1–B13.2):** the inner loops are simulated in 3‑s
+  sub-steps inside each plant step. FIC-101 is an IMC-tuned PI (λ = 12 s) on a first-order valve (τ = 6 s, linear,
+  50 % open at nominal flow). pHIC-201 is a lambda-tuned PI on a lumped extraction-section acidity balance (strong
+  acid/strong base titration curve, 30 s electrode lag). The split-range relay has no gap and no overlap. Reagents are
+  1 mol/L HCl and NaOH at up to 0.05 L/min per L/min of feed, and the feed's free acid is 0.025 mol/L (pH 1.6). All these
+  values are teaching estimates. The defaults (cascade flow, ideal pH) reproduce every earlier reference result.
+  "Extraction pH −0.05" becomes an equivalent feed-acid step when the pH is dynamic.
 * **Feedforward** is static (S = S0·F/F0 using the measured feed flow, with no lag) and acts only on the feed-flow disturbance.
 * **SIMC closed-loop time constant:** τ_c is set to the total dead time (process θ + analyzer delay), the usual "tight
   control" choice.

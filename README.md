@@ -8,13 +8,14 @@ solvent extraction with PC88A / D2EHPA. It is split evenly between two halves:
 * **Part B, Process dynamics and control:** process-control theory (modelling, transfer functions, P/PI/PID,
   stability and frequency response, tuning rules, feedforward, cascade and multivariable control) applied to a
   mixer-settler plant: hydraulics and stage efficiency, start-up, step-test identification, Bode plot with
-  stability margins, disturbance rejection with P, PI and feedforward control, and an animated interactive P&ID
-  showing the control loops and the concentration in every stage.
+  stability margins, disturbance rejection with P, PI and feedforward control, cascade (composition → flow)
+  and split-range (acid/alkali pH) control, and an animated interactive P&ID showing the control loops and the
+  concentration in every stage.
 
 The four pages are:
 
 1. **Background:** a textbook-style chapter (A1–A9 separations, B1–B17 dynamics and control) with derivations and worked examples
-2. **Interactive lab:** sections 1–5 (Part A) and 6–11 (Part B)
+2. **Interactive lab:** sections 1–5 (Part A) and 6–12 (Part B)
 3. **Python code:** every function in full, plus an in-notebook test suite with a pass/fail table
 4. **Attribution:** an AI-generated project; lists models, services and references, with an author placeholder
 
