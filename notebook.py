@@ -181,25 +181,27 @@ def _(np):
         """Loading-limited isotherm y = D x / (1 + D x / Q), Q = C/6."""
         return D * x / (1.0 + D * x / Q)
 
-    def mccabe_thiele(xF, D, OA, N, Q, tol=1e-12):
-        """Counter-current extraction with fresh solvent.
+    def mccabe_thiele(xF, D, OA, n, Q, tol=1e-12):
+        """Counter-current extraction with fresh solvent, n ideal stages.
 
-        Stage n has (x_n, y_n) on the isotherm. A balance over stages n..N gives
-        the operating line x_{n-1} = x_N + (O/A) y_n. Guess the raffinate x_N,
-        step stage by stage up to x_0, and bisect on x_N until x_0 = xF.
-        Returns (x_N, [x_N, x_{N-1}, ..., x_0], [y_N, ..., y_1])."""
+        Stages are numbered i = 1..n from the raffinate end (as everywhere in
+        this notebook): fresh solvent enters stage 1, the feed enters stage n.
+        Stage i has (x_i, y_i) on the isotherm. A balance around stages 1..i gives
+        the operating line  O y_i = A (x_{i+1} - x_1),  i.e.  x_{i+1} = x_1 + (O/A) y_i.
+        Guess the raffinate x_1, step up to x_{n+1}, and bisect on x_1 until
+        x_{n+1} = xF.  Returns (x_1, [x_1, ..., x_{n+1}], [y_1, ..., y_n])."""
 
-        def march(xN):
-            xs, ys, x = [xN], [], xN
-            for _ in range(N):
-                y = isotherm(x, D, Q)
+        def march(x1):
+            xs, ys, x = [x1], [], x1
+            for _ in range(n):
+                y = isotherm(x, D, Q)          # stage i at equilibrium
                 ys.append(y)
-                x = xN + OA * y
+                x = x1 + OA * y                # operating line -> x_{i+1}
                 xs.append(x)
             return x, xs, ys
 
         lo, hi = 0.0, xF
-        for _ in range(200):  # x_0 rises monotonically with x_N
+        for _ in range(200):  # x_{n+1} rises monotonically with x_1
             mid = 0.5 * (lo + hi)
             if march(mid)[0] > xF:
                 hi = mid
@@ -223,11 +225,13 @@ def _(np):
 @app.cell
 def _(C_REF, distribution_ratio, np):
     # ------------------------------------------- steady extraction/scrub cascade
-    # Stages 1..N, N = n_ext + n_scr. Fresh solvent S enters stage 1 and leaves
-    # loaded from stage N (heavy product = extract). Scrub W enters stage N and
-    # the aqueous phase leaves from stage 1 (light product = raffinate). The feed F
-    # enters at stage f = n_ext, so the aqueous flow is W + F in stages 1..n_ext
-    # and W in stages n_ext+1..N. Flows are per unit feed when F = 1.
+    # Cascade-extraction notation: n extraction stages and m scrub stages
+    # (code: n_ext = n, n_scr = m), indexed i = 1..n+m from the raffinate end.
+    # Fresh solvent S enters stage 1 and leaves loaded from stage n+m (heavy
+    # product = extract). Scrub W enters stage n+m and the aqueous phase leaves
+    # from stage 1 (light product = raffinate). The feed F enters stage n, so the
+    # aqueous flow is W + F in stages 1..n and W in stages n+1..n+m.
+    # Flows are per unit feed when F = 1.
 
     PAIR_DEFAULTS = {  # S, W, pH_ext, pH_scr, n_ext, n_scr
         "Pr|Nd": dict(S=2.9, W=0.45, pH_ext=1.9, pH_scr=1.8, n_ext=10, n_scr=10),
@@ -262,8 +266,8 @@ def _(C_REF, distribution_ratio, np):
 
     def cascade_steady(pair, n_ext, n_scr, S, W, pH_ext, pH_scr, F=1.0,
                        cF=CF_DEFAULT, frac_heavy=0.5, C=C_REF):
-        """Ideal-stage steady state. For each element and stage n:
-           S D(n-1) x(n-1) - (S D(n) + L(n)) x(n) + L(n+1) x(n+1) = -F cF [n = f]
+        """Ideal-stage steady state. For each element and stage i = 1..n+m:
+           S D(i-1) x(i-1) - (S D(i) + L(i)) x(i) + L(i+1) x(i+1) = -F cF [i = n]
         which is tridiagonal, one system per element (constant D, no coupling)."""
         light, heavy = pair.split("|")
         N, L = cascade_flows(n_ext, n_scr, W, F)
@@ -298,7 +302,42 @@ def _(C_REF, distribution_ratio, np):
         out["loading_ok"] = out["peak_loading"] <= Q   # validity check
         return out
 
-    return CF_DEFAULT, PAIR_DEFAULTS, cascade_flows, cascade_steady, thomas_solve
+    def cascade_operating_lines(cas, el, S, W, F=1.0):
+        """McCabe-Thiele construction for one element of a solved cascade.
+
+        Extraction section (balance around stages 1..i, i = 0..n-1):
+            S y_i = (W + F) (x_{i+1} - x_1)        ->  y = ((W+F)/S) (x - x_1)
+        Scrub section (balance around stages i..n+m, i = n+1..n+m+1):
+            S y_{i-1} = W x_i + S y_{n+m}          ->  y = (W/S) x + y_{n+m}
+        The lines cross at x = c_F (the feed line). Returns the line parameters,
+        the staircase through the stage points, and the largest balance residual."""
+        x, y, D = cas[el]["x"], cas[el]["y"], cas[el]["D"]
+        n, N = cas["n_ext"], cas["N"]
+        x1, yP, cF = x[0], y[-1], cas[el]["feed"] / F
+        ext_slope, scr_slope = (W + F) / S, W / S
+        # residuals of both operating-line equations at every stage pair
+        res_e = [S * y[i - 1] - (W + F) * (x[i] - x1) for i in range(1, n)]
+        res_s = [S * y[i - 2] - (W * x[i - 1] + S * yP) for i in range(n + 1, N + 1)]
+        # staircase: (x_1, 0) -> (x_1, y_1) -> (x_2, y_1) -> (x_2, y_2) -> ... -> (0, y_{n+m})
+        sx, sy = [x1, x1], [0.0, y[0]]
+        for i in range(1, N):
+            sx += [x[i], x[i]]
+            sy += [y[i - 1], y[i]]
+        sx.append(0.0)
+        sy.append(yP)
+        return dict(x1=x1, yP=yP, cF=cF, ext_slope=ext_slope, scr_slope=scr_slope,
+                    x_cross=((W + F) * x1 + S * yP) / F, D_ext=D[0], D_scr=D[-1],
+                    stair_x=np.array(sx), stair_y=np.array(sy), x=x, y=y, n=n, N=N,
+                    residual=float(max(abs(r) for r in res_e + res_s)))
+
+    return (
+        CF_DEFAULT,
+        PAIR_DEFAULTS,
+        cascade_flows,
+        cascade_operating_lines,
+        cascade_steady,
+        thomas_solve,
+    )
 
 
 @app.cell
@@ -361,8 +400,9 @@ def _(CF_DEFAULT, C_REF, KL, KU, band_lu, band_solve, distribution_ratio, np):
     # ---------------------------------------------- mixer-settler dynamics
     # Each stage = perfectly mixed mixer (states xm, ym) followed by a lumped
     # settler (states xs, ys). Unknowns per element are ordered
-    # [xm1, ym1, xs1, ys1, xm2, ...], so mixer n couples to settler n+1
-    # (offset +6) and settler n-1 (offset -2): a band of half-width 6.
+    # [xm1, ym1, xs1, ys1, xm2, ...] (xm, ym = mixer; xs, ys = settler), so mixer i
+    # couples to settler i+1 (offset +6) and settler i-1 (offset -2): half-width 6.
+    # Stage count N = n + m (n_ext extraction + n_scr scrub stages).
     # Units: flows L/min, volumes L, concentrations mmol/L, time min.
 
     def make_plant(pair, n_ext, n_scr, S, W, pH_ext, pH_scr, F=1.0, V_mix=8.0,
@@ -993,6 +1033,7 @@ def _(
     band_lu,
     band_solve,
     band_to_dense,
+    cascade_operating_lines,
     cascade_steady,
     distribution_ratio,
     efficiency_sweep,
@@ -1050,7 +1091,7 @@ def _(
         # McCabe-Thiele, Nd, 40 mmol/L, O/A 1, pH 2.3, Q = 500/6 mmol/L
         D_nd = float(distribution_ratio("Nd", 2.3))
         for N, v in zip(range(1, 5), [6.910, 1.122, 0.152, 0.019]):
-            check(f"McCabe-Thiele Nd raffinate N = {N} (mmol/L)", v,
+            check(f"McCabe-Thiele Nd raffinate x_1, n = {N} stages (mmol/L)", v,
                   mccabe_thiele(40.0, D_nd, 1.0, N, 500.0 / 6.0)[0], 0.0005)
 
         # banded solver against numpy dense solve
@@ -1067,6 +1108,13 @@ def _(
         check("Pr|Nd cascade raffinate purity (%)", 79.6, cas["raff_purity"], 0.1)
         check("Pr|Nd cascade extract purity (%)", 79.6, cas["ext_purity"], 0.1)
         check("cascade mass balance closure", 0.0, cas["balance_error"], 1e-10)
+        # McCabe-Thiele operating lines of the cascade: every stage on its line, lines cross at x = c_F
+        for _pair in ("Pr|Nd", "La|Ce"):
+            _c = cascade_steady(_pair, **PAIR_DEFAULTS[_pair])
+            for _el in (_c["light"], _c["heavy"]):
+                _o = cascade_operating_lines(_c, _el, PAIR_DEFAULTS[_pair]["S"], PAIR_DEFAULTS[_pair]["W"])
+                check(f"{_pair} {_el}: stages lie on the two operating lines (max residual)", 0.0, _o["residual"], 1e-9)
+                check(f"{_pair} {_el}: operating lines cross at the feed line x = c_F", _o["cF"], _o["x_cross"], 1e-9)
 
         # dynamic model with very fast transfer reduces to the ideal cascade
         fast = make_plant("Pr|Nd", **PAIR_DEFAULTS["Pr|Nd"], tau_mt=1e-6)
@@ -1376,7 +1424,7 @@ def _():
         o.append(_t(20, 26, "(a) How neighbouring mixer-settlers are connected", 14, "start", weight="600"))
         top, bot = 130, 230                        # vertical extent of units
         mid = (top + bot) / 2                      # nominal interface in the settler
-        units = [(60, "n−1", "n−2", "n"), (420, "n", "n−1", "n+1"), (780, "n+1", "n", "n+2")]
+        units = [(60, "i−1", "i−2", "i"), (420, "i", "i−1", "i+1"), (780, "i+1", "i", "i+2")]
         mw, sw = 70, 230                           # mixer width, settler width
         for x, name, prev, nxt in units:
             mx, sx = x, x + mw + 10                # mixer, settler left edges
@@ -1409,7 +1457,7 @@ def _():
             o.append(_path(f"M{ox_out},{top + 14} L{ox_out + 18},{top + 14} L{ox_out + 18},{top - 55} "
                            f"L{nx_mixer},{top - 55} L{nx_mixer},{top}", ORG_LINE, "ao"))
             # aqueous leaves under the weir -> mixer of the PREVIOUS stage (backward, below the units)
-            lane = bot + 50 if name != "n" else bot + 75
+            lane = bot + 50 if name != "i" else bot + 75
             px = x - 360 - 16                      # just left of the previous mixer
             o.append(_path(f"M{ox_out},{bot - 8} L{ox_out + 8},{bot - 8} L{ox_out + 8},{lane} "
                            f"L{px},{lane} L{px},{bot - 18} L{px + 14},{bot - 18}", AQ_LINE, "aa"))
@@ -1417,16 +1465,16 @@ def _():
         o.append(f'<rect x="0" y="40" width="40" height="{H - 40}" fill="#fcfcfb"/>')
         o.append(f'<rect x="{W - 30}" y="40" width="30" height="{H - 40}" fill="#fcfcfb"/>')
         o.append(_path(f"M8,{top - 55} L{60 + mw / 2 - 18},{top - 55} L{60 + mw / 2 - 18},{top}", ORG_LINE, "ao"))
-        o.append(_t(8, top - 62, "organic y_{n−2} from settler n−2", 10, "start", ORG_LINE))
-        o.append(_t(W - 8, top - 62, "to mixer n+2", 10, "end", ORG_LINE))
+        o.append(_t(8, top - 62, "organic y_{i−2} from settler i−2", 10, "start", ORG_LINE))
+        o.append(_t(W - 8, top - 62, "to mixer i+2", 10, "end", ORG_LINE))
         o.append(_path(f"M{W - 8},{bot + 75} L{780 - 16},{bot + 75} L{780 - 16},{bot - 18} L{780 - 2},{bot - 18}", AQ_LINE, "aa"))
-        o.append(_t(W - 8, bot + 92, "aqueous x_{n+2} from settler n+2", 10, "end", AQ_LINE))
-        o.append(_t(44, bot + 40, "to mixer n−2", 10, "start", AQ_LINE))
+        o.append(_t(W - 8, bot + 92, "aqueous x_{i+2} from settler i+2", 10, "end", AQ_LINE))
+        o.append(_t(44, bot + 40, "to mixer i−2", 10, "start", AQ_LINE))
         # one label per stream, on its own line
-        o.append(_t(455, 64, "organic y_{n−1}: settler n−1 → mixer n", 10, "middle", ORG_LINE))
-        o.append(_t(815, 64, "organic y_{n}: settler n → mixer n+1", 10, "middle", ORG_LINE))
-        o.append(_t(250, bot + 92, "← aqueous x_{n}: settler n → mixer n−1 (underflow)", 10, "middle", AQ_LINE))
-        o.append(_t(930, bot + 40, "← aqueous x_{n+1}: settler n+1 → mixer n", 10, "middle", AQ_LINE))
+        o.append(_t(455, 64, "organic y_{i−1}: settler i−1 → mixer i", 10, "middle", ORG_LINE))
+        o.append(_t(815, 64, "organic y_{i}: settler i → mixer i+1", 10, "middle", ORG_LINE))
+        o.append(_t(250, bot + 92, "← aqueous x_{i}: settler i → mixer i−1 (underflow)", 10, "middle", AQ_LINE))
+        o.append(_t(930, bot + 40, "← aqueous x_{i+1}: settler i+1 → mixer i", 10, "middle", AQ_LINE))
         # legend
         ly = H - 22
         o.append(f'<rect x="20" y="{ly - 10}" width="14" height="12" fill="url(#disp)" stroke="{INK2_D}" stroke-width="0.5"/>')
@@ -1439,12 +1487,12 @@ def _():
         o.append("</svg>")
         return "".join(o)
 
-    def cascade_overview_svg(n_ext_label="n_{Ext}", example=""):
+    def cascade_overview_svg(example=""):
         """Panel (b): the whole cascade with stage numbers, sections and every stream."""
         W, H = 1100, 490
         o = _svg_open(W, H, "Extraction and scrub cascade with stage and stream names")
         o.append(_t(20, 26, "(b) The extraction / scrub cascade: stages and streams", 14, "start", weight="600"))
-        labels = ["1", "2", "…", "f = n_{Ext}", "f + 1", "…", "N"]
+        labels = ["1", "2", "…", "n (feed)", "n + 1", "…", "n + m"]
         sect = ["E", "E", "E", "E", "S", "S", "S"]
         x0, pitch, bw = 170, 115, 84
         top, bot = 175, 285
@@ -1466,8 +1514,8 @@ def _():
             o.append(_path(f"M{a},{yo} L{b - 2},{yo}", ORG_LINE, "ao", 2))
             o.append(_path(f"M{b},{ya} L{a + 2},{ya}", AQ_LINE, "aa", 2))
         # section brackets
-        for i0, i1, t1, t2, shift in ((0, 3, "Extraction section: stages 1 … n_{Ext} (pH_{ext})", "aqueous flow L = W + F", -40),
-                                      (4, 6, "Scrub section: stages n_{Ext}+1 … N (pH_{scr})", "aqueous flow L = W", 0)):
+        for i0, i1, t1, t2, shift in ((0, 3, "Extraction section: n stages, i = 1 … n (pH_{ext})", "aqueous flow L = W + F", -40),
+                                      (4, 6, "Scrub section: m stages, i = n+1 … n+m (pH_{scr})", "aqueous flow L = W", 0)):
             xa, xb = xs[i0], xs[i1] + bw
             o.append(f'<path d="M{xa},{top - 40} L{xa},{top - 48} L{xb},{top - 48} L{xb},{top - 40}" fill="none" stroke="{INK2_D}"/>')
             o.append(_t((xa + xb) / 2 + shift, top - 70, t1, 11))
@@ -1974,27 +2022,29 @@ def _(PAGES, cascade_overview_svg, mixer_settler_detail_svg, mo, nav):
 wedge-shaped **dispersion band**, and the light **organic** layer separates above the heavier **aqueous** layer. Organic
 leaves over the **organic weir** and flows *forward* to the mixer of the next stage. Aqueous leaves under the
 **aqueous (underflow) weir** and flows *back* to the mixer of the previous stage. Every mixer therefore receives organic
-from stage n−1 and aqueous from stage n+1: this is **counter-current** flow, built from stages that are individually
+from stage i−1 and aqueous from stage i+1: this is **counter-current** flow, built from stages that are individually
 co-current. **(b)** shows the whole cascade with the names used throughout this notebook.
 """),
         mo.Html(mixer_settler_detail_svg()),
-        mo.Html(cascade_overview_svg(example="Default Pr|Nd example: n_Ext = 10 extraction stages, n_Scr = 10 scrub stages, "
-                                             "N = 20; S = 2.9, W = 0.45 per unit feed; pH 1.9 / 1.8.")),
+        mo.Html(cascade_overview_svg(example="Default Pr|Nd example: n = 10 extraction stages, m = 10 scrub stages, "
+                                             "n + m = 20; S = 2.9, W = 0.45 per unit feed; pH 1.9 / 1.8.")),
         mo.md(r"""
 | Name | Symbol | Where | Meaning |
 |---|---|---|---|
-| Stage $n$ | $n = 1 \dots N$ | One mixer + one settler | Numbered from the raffinate end. $N = n_{Ext} + n_{Scr}$ |
-| Extraction section | stages $1 \dots n_{Ext}$ | Between the solvent inlet and the feed | Heavy element is pulled into the organic. Aqueous flow $W + F$, pH = extraction pH |
-| Feed stage | $f = n_{Ext}$ | Last extraction stage | Where the feed joins the aqueous flow |
-| Scrub section | stages $n_{Ext}+1 \dots N$ | Between the feed and the scrub inlet | Light element is washed back out of the organic. Aqueous flow $W$, pH = scrub pH |
-| Feed | $F$, $c_F$ | Into stage $f$ (aqueous) | The mixed rare-earth solution to be separated |
+| Number of extraction stages | $n$ | Slider *n* in Lab 5 (`n_ext` in code) | Cascade-extraction notation |
+| Number of scrub stages | $m$ | Slider *m* in Lab 5 (`n_scr` in code) | Total stages $n + m$ |
+| Stage $i$ | $i = 1 \dots n+m$ | One mixer + one settler | Numbered from the raffinate end |
+| Extraction section | stages $1 \dots n$ | Between the solvent inlet and the feed | Heavy element is pulled into the organic. Aqueous flow $W + F$, pH = extraction pH |
+| Feed stage | stage $n$ | Last extraction stage | Where the feed joins the aqueous flow |
+| Scrub section | stages $n+1 \dots n+m$ | Between the feed and the scrub inlet | Light element is washed back out of the organic. Aqueous flow $W$, pH = scrub pH |
+| Feed | $F$, $c_F$ | Into stage $n$ (aqueous) | The mixed rare-earth solution to be separated |
 | Fresh (barren) organic | $S$ | Into stage 1 (organic) | Metal-free solvent, regenerated by stripping in a real plant |
-| Scrub liquor | $W$ | Into stage $N$ (aqueous) | Dilute acid that scrubs the loaded organic |
+| Scrub liquor | $W$ | Into stage $n+m$ (aqueous) | Dilute acid that scrubs the loaded organic |
 | Raffinate | $L_1 x_1$ | Out of stage 1 (aqueous) | **Light product** |
-| Loaded organic (extract) | $S\,y_N$ | Out of stage $N$ (organic) | **Heavy product**. Goes to stripping in a real plant |
-| Stage concentrations | $x_n$, $y_n$ | Settler $n$ outlets | Aqueous and organic concentrations leaving stage $n$ (mixer values $x_m, y_m$ in the dynamic model) |
-| Organic between stages | $y_{n-1} \to$ mixer $n$ | Over the organic weirs | Flows towards higher $n$ |
-| Aqueous between stages | $x_{n+1} \to$ mixer $n$ | Under the aqueous weirs | Flows towards lower $n$ |
+| Loaded organic (extract) | $S\,y_{n+m}$ | Out of stage $n+m$ (organic) | **Heavy product**. Goes to stripping in a real plant |
+| Stage concentrations | $x_i$, $y_i$ | Settler $i$ outlets | Aqueous and organic concentrations leaving stage $i$ (mixer values $x_i^{mix}, y_i^{mix}$ in the dynamic model) |
+| Organic between stages | $y_{i-1} \to$ mixer $i$ | Over the organic weirs | Flows towards higher $i$ |
+| Aqueous between stages | $x_{i+1} \to$ mixer $i$ | Under the aqueous weirs | Flows towards lower $i$ |
 
 The same layout, with live concentrations and the control instruments added, is the P&ID in **Lab 11**.
 """),
@@ -2107,7 +2157,8 @@ Lab 2 and remain estimates. No idx value was changed.
 **Derivation of the Fenske equation.** In an ideal stage the outgoing phases are in equilibrium, so their
 heavy/light ratios differ by exactly β: $(y_h/y_l) = \beta\,(x_h/x_l)$. At **total reflux** (all product returned,
 the limit of infinite internal flow), the stream leaving one stage has the same composition as the other phase
-entering it. The ratio is therefore multiplied by β at every stage. Over $N$ stages,
+entering it. The ratio is therefore multiplied by β at every stage. Over $N$ stages in total (in an extraction/scrub
+cascade, $N = n + m$),
 
 $$\left(\frac{h}{l}\right)_{\text{heavy end}} = \beta^{N}\left(\frac{h}{l}\right)_{\text{light end}}$$
 
@@ -2124,21 +2175,27 @@ With the Ce(IV) switch on, Pr/Ce falls below 1 because Ce now extracts first. La
 $\max(\beta, 1/\beta)$ and labels the pair "inverted".
 
 ### A6 · Counter-current extraction: the Kremser equation  → *Lab 3*
-**Set-up.** There are $N$ ideal stages. The aqueous enters stage 1 at $x_0 = x_F$ and leaves stage $N$ as raffinate $x_N$.
-Fresh solvent enters stage $N$ ($y_{N+1} = 0$), and the flows $A$, $O$ and $D$ are constant.
+**Set-up and numbering.** Take $n$ ideal stages in counter-current flow. As everywhere in this notebook, stages are
+numbered $i = 1 \dots n$ **from the raffinate end**. Fresh solvent enters stage 1 ($y_0 = 0$) and leaves stage $n$ loaded.
+The feed enters stage $n$ ($x_{n+1} \equiv x_F$), and the raffinate leaves stage 1 as $x_1$. The flows $A$ (aqueous) and $O$
+(organic) and the distribution ratio $D$ are constant. This is the extraction section of A8 with no scrub stages ($m = 0$).
 
-**Derivation.** A balance on stage $n$ is $A x_{n-1} + O y_{n+1} = A x_n + O y_n$. With $y = Dx$ and $E = DO/A$:
+**Derivation.** On stage $i$, the aqueous arrives from stage $i+1$ and the organic from stage $i-1$:
 
-$$x_{n-1} - (1+E)\,x_n + E\,x_{n+1} = 0$$
+$$A\,x_{i+1} + O\,y_{i-1} = A\,x_i + O\,y_i$$
 
-This linear difference equation has characteristic roots $r = 1$ and $r = 1/E$, so $x_n = c_1 + c_2 E^{-n}$.
-Applying $x_0 = x_F$ and $x_{N+1} = 0$ (no metal in the fresh solvent) gives the **Kremser equation**:
+With $y = Dx$ and $E = DO/A$ this becomes the linear difference equation
 
-$$\varphi = \frac{x_N}{x_F} = \frac{E-1}{E^{N+1}-1}\qquad\Big(\varphi = \tfrac{1}{N+1}\ \text{at}\ E = 1\Big),\qquad \text{recovery} = 1 - \varphi$$
+$$x_{i+1} - (1+E)\,x_i + E\,x_{i-1} = 0$$
+
+Its characteristic roots are $r = 1$ and $r = E$, so $x_i = c_1 + c_2E^{i}$. Applying $x_0 = 0$ (fresh solvent, $y_0 = 0$)
+and $x_{n+1} = x_F$ gives $c_1 = -c_2$ and $c_2 = x_F/(E^{n+1} - 1)$, and hence the **Kremser equation**:
+
+$$\varphi = \frac{x_1}{x_F} = \frac{E-1}{E^{n+1}-1}\qquad\Big(\varphi = \tfrac{1}{n+1}\ \text{at}\ E = 1\Big),\qquad \text{recovery} = 1 - \varphi$$
 
 * $E > 1$: recovery approaches 1 geometrically as stages are added.
-* $E < 1$: as $N\to\infty$, $\varphi \to 1 - E$, so recovery can never exceed $E$. The solvent cannot carry more
-  metal than its flow allows: $O\,y_1 \le O\,D\,x_F = E\,A\,x_F$. This is the **ceiling** (dashed lines in Lab 3).
+* $E < 1$: as $n\to\infty$, $\varphi \to 1 - E$, so recovery can never exceed $E$. The solvent cannot carry more metal
+  than its flow allows: $O\,y_n \le O\,D\,x_F = E\,A\,x_F$. This is the **ceiling** (dashed lines in Lab 3).
 * **Separation by staging.** Two metals with $E_{heavy} > 1 > E_{light}$ are recovered completely and capped at $E$
   respectively. Adding stages sharpens that contrast.
 
@@ -2147,46 +2204,66 @@ $$\varphi = \frac{x_N}{x_F} = \frac{E-1}{E^{N+1}-1}\qquad\Big(\varphi = \tfrac{1
 
 ### A7 · Loading limits and the McCabe–Thiele method  → *Lab 4*
 Kremser needs a constant $D$. When the solvent approaches saturation, $D$ falls, and a **graphical stage-by-stage**
-method is needed. The lab uses a Langmuir-type isotherm with the stoichiometric limit $Q = C/6$ (A3):
+method is needed. McCabe–Thiele draws two curves on a $y$ (organic) against $x$ (aqueous) diagram: the **equilibrium
+line**, which every stage's outlet pair $(x_i, y_i)$ satisfies, and the **operating line**, which every pair of
+streams *passing between* stages satisfies.
 
-$$y = \frac{D\,x}{1 + D\,x/Q}$$
+**Equilibrium line (isotherm).** The lab uses a Langmuir-type isotherm with the stoichiometric limit $Q = C/6$ (A3):
+
+$$y_i = \frac{D\,x_i}{1 + D\,x_i/Q}$$
 
 It is linear with slope $D$ at low $x$ and flattens to $Q$ (83.3 mmol/L at C = 0.5 M).
 
-* **Operating line.** A balance from stage $n$ to the raffinate end, with fresh solvent, gives
-  $A(x_{n-1} - x_N) = O\,y_n$, that is $x_{n-1} = x_N + (O/A)\,y_n$. It is straight, with slope $A/O$ on a $y$-vs-$x$ plot,
-  from $(x_N, 0)$ to $(x_F, y_1)$.
-* **Stepping.** Each ideal stage is a step: horizontally from the operating line to the isotherm (equilibrium), then
-  vertically to the operating line (the balance). The number of steps between $x_F$ and $x_N$ is the number of stages.
-* **Minimum solvent.** The operating line cannot cross the isotherm. As O/A falls, the line pivots about $(x_N, 0)$
-  until it touches the isotherm at the feed end (a **pinch**), where infinitely many stages are needed:
-  $(O/A)_{min} = (x_F - x_N)/y^*(x_F)$.
-* **Solution for a given N.** Guess $x_N$, step up $N$ stages to compute $x_0$, and **bisect** on $x_N$ until $x_0 = x_F$.
-  This works because $x_0$ increases monotonically with $x_N$.
+**Operating line: derivation.** Draw a control volume around stages $1 \dots i$ at the raffinate end. Metal enters with the fresh
+solvent (none) and with the aqueous arriving from stage $i+1$ ($A\,x_{i+1}$). It leaves with the organic leaving stage $i$
+($O\,y_i$) and with the raffinate ($A\,x_1$). At steady state:
 
-> **Worked example.** Nd at 40 mmol/L, pH 2.3, O/A = 1 has $D = 7.943$. The raffinate is 6.910, 1.122, 0.152 and
-> 0.019 mmol/L for N = 1–4. The isotherm gives $y^*(40) = 66.0$ mmol/L, so complete extraction needs
-> $(O/A)_{min} = 40/66.0 = 0.61$. Below it, even 30 stages leave Nd in the raffinate (try O/A = 0.6).
+$$O\,y_i = A\,(x_{i+1} - x_1)\qquad\Longrightarrow\qquad \boxed{\,y = \frac{A}{O}\,(x - x_1)\,}\qquad (i = 0 \dots n,\ x_{n+1} \equiv x_F)$$
+
+* It is a **straight line** because the flows are constant, with **slope $A/O$**, the inverse of the phase ratio.
+* It passes through $(x_1, 0)$, the raffinate end where fresh solvent enters, and through $(x_F, y_n)$, the feed end
+  where the loaded organic leaves. The overall balance $O\,y_n = A\,(x_F - x_1)$ is the special case $i = n$.
+* The points on it are the **passing-stream pairs** $(x_{i+1}, y_i)$: the aqueous entering stage $i$ and the organic
+  leaving it.
+
+**Stepping off stages.** Start at the raffinate end, $(x_1, 0)$. Go vertically to the equilibrium line at $(x_1, y_1)$: this
+is stage 1. Go horizontally to the operating line at $(x_2, y_1)$, which is the balance. Then vertically to $(x_2, y_2)$ for
+stage 2, and so on. The number of vertical steps needed to reach $x = x_F$ is the number of ideal stages.
+
+* **Minimum solvent.** The operating line cannot cross the equilibrium line. As O/A falls, the line steepens about
+  $(x_1, 0)$ until it touches the isotherm at the feed end, a **pinch** where infinitely many stages are needed:
+  $(O/A)_{min} = (x_F - x_1)/y^*(x_F)$.
+* **Solution for a given n.** Guess $x_1$, step up $n$ stages to get $x_{n+1}$, and **bisect** on $x_1$ until
+  $x_{n+1} = x_F$. This works because $x_{n+1}$ rises monotonically with $x_1$.
+
+> **Worked example.** Nd at 40 mmol/L, pH 2.3, O/A = 1 has $D = 7.943$. The raffinate $x_1$ is 6.910, 1.122, 0.152 and
+> 0.019 mmol/L for $n$ = 1–4. With $n$ = 3 the operating line is $y = 1.0\,(x - 0.152)$. The isotherm gives
+> $y^*(40) = 66.0$ mmol/L, so complete extraction needs $(O/A)_{min} = 40/66.0 = 0.61$. Below it, even 30 stages leave
+> Nd in the raffinate (try O/A = 0.6).
 
 ### A8 · The extraction / scrub cascade  → *Lab 5*
 To split a binary feed into **two** pure products, the feed enters the **middle** of a cascade (Figure A1b in A1.9):
 
-* **Numbering.** Stages $1..N$, $N = n_{Ext} + n_{Scr}$. The **extraction section** is $1..n_{Ext}$ and the
-  **scrub section** is $n_{Ext}+1..N$. The feed is at $f = n_{Ext}$.
-* **Flows.** Fresh solvent $S$ enters stage 1 and leaves stage $N$ as the **extract** (heavy product). Scrub liquor
-  $W$ enters stage $N$, and the aqueous leaves stage 1 as the **raffinate** (light product). The aqueous flow is
-  $L = W + F$ in extraction and $W$ in scrub. S and W are quoted **per unit feed flow**.
-* **pH.** $D$ is evaluated at the extraction pH in stages $1..f$ and at the lower scrub pH after.
+* **Numbering (cascade-extraction notation).** The cascade has **$n$ extraction stages and $m$ scrub stages**, $n + m$ in
+  all. This is the notation of rare-earth cascade-extraction theory. The lab's sliders are labelled *n* and *m*; the code
+  calls them `n_ext` and `n_scr`. Stages are indexed $i = 1 \dots n+m$ from the raffinate end. The **extraction section**
+  is $i = 1 \dots n$, the **scrub section** is $i = n+1 \dots n+m$, and the feed enters stage $n$, the last extraction stage.
+* **Flows.** Fresh solvent $S$ enters stage 1 and leaves stage $n+m$ as the **extract** (heavy product). Scrub liquor
+  $W$ enters stage $n+m$, and the aqueous leaves stage 1 as the **raffinate** (light product). The aqueous flow is
+  $L_i = W + F$ in extraction ($i \le n$) and $W$ in scrub ($i > n$). S and W are quoted **per unit feed flow**.
+* **pH.** $D_i$ is evaluated at the extraction pH in stages $1 \dots n$ and at the lower scrub pH in stages $n+1 \dots n+m$.
 
-**Stage balance.** What enters stage $n$ (organic from $n-1$, aqueous from $n+1$, feed) equals what leaves:
+**Stage balance.** What enters stage $i$ (organic from stage $i-1$, aqueous from stage $i+1$, plus the feed at $i = n$) equals what
+leaves:
 
-$$S\,D(n-1)\,x(n-1) - \big(S\,D(n)+L(n)\big)\,x(n) + L(n+1)\,x(n+1) = -F\,c_F\,[n=f]$$
+$$S\,D_{i-1}\,x_{i-1} - \big(S\,D_i+L_i\big)\,x_i + L_{i+1}\,x_{i+1} = -F\,c_F\,[i=n],\qquad x_0 = x_{n+m+1} = 0$$
 
 $c_F$ is that element's feed concentration (**Feed total** × its fraction, set by **Feed heavy fraction**). Each element
-gives a **tridiagonal** system, solved by the Thomas algorithm (forward elimination, back substitution, $O(N)$ work).
+gives a **tridiagonal** system of $n+m$ equations, solved by the Thomas algorithm (forward elimination, back
+substitution, work proportional to $n+m$).
 With constant $D$ the elements do not interact.
 
-**The extraction-factor window.** In stage $n$, $E_n = S D_n/L_n$. Separation requires:
+**The extraction-factor window.** In stage $i$, $E_i = S D_i/L_i$. Separation requires:
 
 * in the **extraction section**, $E_{heavy} > 1$, so the heavy element is carried up into the organic, and
   $E_{light} < 1$, so the light element is left in the aqueous;
@@ -2201,6 +2278,50 @@ can be tuned separately.
 > $E_{Pr} = 1.079$, $E_{Nd} = 1.619$. Nd sits on the edge in extraction, and Pr is slightly above 1 in scrub. Both
 > products are therefore only **79.6 %** pure with 20 stages. Fenske's minimum for 99.9 % is 34 stages at total reflux.
 
+**Operating lines of the cascade (McCabe–Thiele for extraction + scrub)  → *Lab 5*.** A7's construction extends to the
+two-section cascade. For each element there are now **two operating lines**, one per section, and **two equilibrium lines**,
+because the two sections have different pH values.
+
+* **Extraction-section operating line.** Use a control volume around stages $1 \dots i$ ($i = 0 \dots n-1$). Metal comes in
+  with the aqueous from stage $i+1$; it leaves with the organic from stage $i$ and with the raffinate:
+  $$S\,y_i = (W + F)\,(x_{i+1} - x_1)\qquad\Longrightarrow\qquad y = \frac{W + F}{S}\,(x - x_1)$$
+  This has slope $(W+F)/S$ and passes through the raffinate point $(x_1, 0)$.
+* **Scrub-section operating line.** Use a control volume around stages $i \dots n+m$ ($i = n+1 \dots n+m+1$). Metal comes in
+  with the organic from stage $i-1$ (the scrub liquor carries none); it leaves with the loaded organic and with the
+  aqueous going down from stage $i$:
+  $$S\,y_{i-1} = W\,x_i + S\,y_{n+m}\qquad\Longrightarrow\qquad y = \frac{W}{S}\,x + y_{n+m}$$
+  This has slope $W/S$ and meets the $y$-axis at the extract concentration $y_{n+m}$.
+* **Feed line.** Setting the two lines equal gives $F\,x = (W+F)\,x_1 + S\,y_{n+m}$. The right-hand side is everything that
+  leaves, which equals what the feed brings in, $F\,c_F$. So the lines always cross at
+  $$x = c_F$$
+  a vertical **feed line**. It is the SX counterpart of the *q*-line in distillation with an all-liquid feed, since the
+  feed here is entirely aqueous.
+* **Equilibrium lines.** $y = D_{ext}\,x$ for stages $1 \dots n$ and $y = D_{scr}\,x$ for stages $n+1 \dots n+m$.
+* **Stepping.** Start at $(x_1, 0)$ and alternate vertical steps to the equilibrium line (one stage each) with horizontal
+  steps to the operating line. Use the extraction line for stages $1 \dots n$; at the feed stage the horizontal step goes
+  to the scrub line, because the pair $(x_{n+1}, y_n)$ lies on the scrub line (a balance around stages $1 \dots n$
+  includes the feed). Then walk along the scrub line until the scrub inlet, where $x_{n+m+1} = 0$.
+* **How this differs from distillation.** A distillation McCabe–Thiele plots mole *fractions*, which lie between the two
+  product compositions, so the staircase switches lines where it crosses the feed (q-) line. Here *concentrations* are
+  plotted, and the internal metal inventory (A8, profiles) pushes stage concentrations well **above $c_F$ on both sides of the
+  feed**. The extraction staircase therefore runs past the crossing point, the feed-stage step jumps to the scrub line at
+  a much higher $x$, and the scrub staircase walks back down to $x = 0$. The crossing at $x = c_F$ is still exact (it is the
+  overall balance), but it does not mark the optimum feed stage. In this notebook $n$ and $m$ are chosen by trial in Lab 5.
+* **Parallel lines and pinches.** With constant $D$ and flows, the difference equation of A6 gives
+  $x_{i+1} - x_i = E\,(x_i - x_{i-1})$ with $E = S D_{ext}/(W+F)$: each step is $E$ times the previous one, which is
+  Kremser's geometric series. When the operating and equilibrium lines are **parallel** ($E \approx 1$), every stage gains
+  the same small, constant step and stages are used inefficiently. When they **converge** ($E < 1$ for the element that should move), they meet in a **pinch**, and further
+  stages achieve nothing. The scrub section behaves the same way with $W/S$ and $D_{scr}$.
+
+> **Worked example (Pr|Nd default, Lab 5's McCabe–Thiele chart).** The extraction operating line is
+> $y = 0.500\,(x - 7.05)$ (slope $(W+F)/S$ = 1.45/2.9). For Nd, $D_{ext}$ = **0.501**, so the two lines are almost
+> parallel: the gap stays at about $0.5 \times 7.05 \approx 3.5$ mmol/L, and each of the ten extraction stages gains the
+> same small step instead of a growing one. As a result $x_1$(Nd) = 7.05 mmol/L of Nd escapes to the raffinate. The scrub
+> operating line is $y = 0.155\,x + 13.7$; for Pr, $D_{scr}$ = 0.168, again nearly parallel, so $y_{n+m}$(Pr) = 3.51 mmol/L of Pr
+> stays in the extract. Both lines cross at $x = c_F$ = 50 mmol/L, while the Nd staircase runs up to $x \approx$ 142 mmol/L at
+> stage 11. These two near-parallel sections are the graphical reason the purities stop at 79.6 %, and the same fact as the
+> extraction factors $E \approx 1$ above. Raising S slightly, or lowering the scrub pH, opens the gaps (try it in Lab 5).
+
 **What Lab 5 reports.**
 * **Purity**: light/(light + heavy) in the raffinate and heavy/(light + heavy) in the extract.
 * **Recovery**: the fraction of each element's feed reaching its own product. Purity and recovery trade off. Moving S up
@@ -2208,7 +2329,9 @@ can be tuned separately.
 * **Profiles**: both elements peak near the feed stage, above the feed concentration. Metal recirculates: the scrub
   returns it down, extraction picks it up again, and an internal inventory builds up. This inventory is what makes
   start-up slow (B8).
-* **Fenske $N_{min}$** as a benchmark, and the **extraction-factor table**.
+* **Fenske $N_{min}$** as a benchmark for the total $n + m$, the **extraction-factor table**, and a
+  **McCabe–Thiele diagram** for either element: the two operating lines, both equilibrium lines, the feed line and the
+  staircase through the computed stages.
 * **Loading check**: if the peak total organic loading $\sum_i D_i x_i$ exceeds $Q = C/6$, the constant‑D
   model is invalid and a red warning appears. A higher feed concentration raises loading proportionally.
 
@@ -2361,18 +2484,18 @@ def _(PAGES, mo, nav):
         r"""
 ### B5 · Mixer-settler hydraulics  → *Lab 6*
 A mixer-settler stage has a small agitated **mixer** (volume $V_{mix}$) and a larger, quiet **settler**
-($V_{set}$). The organic flows from settler $n$ to mixer $n+1$, and the aqueous flows from settler $n$ to mixer $n-1$,
+($V_{set}$). The organic flows from settler $i$ to mixer $i+1$, and the aqueous flows from settler $i$ to mixer $i-1$,
 which gives counter-current flow. Each unit's **mean residence time** is its volume over the total flow through it:
 
-$$\tau_{mix} = \frac{V_{mix}}{S + L_n},\qquad \tau_{set} = \frac{V_{set}}{S + L_n}$$
+$$\tau_{mix} = \frac{V_{mix}}{S + L_i},\qquad \tau_{set} = \frac{V_{set}}{S + L_i}$$
 
-$L_n$ is larger in the extraction section ($W+F$) than in the scrub section ($W$), so scrub stages hold the liquid longer
+$L_i$ is larger in the extraction section ($W+F$) than in the scrub section ($W$), so scrub stages hold the liquid longer
 (the step in Lab 6's bars). S and W from Lab 5 are per unit feed and are multiplied by the **feed flow F**, so doubling F
 halves every residence time.
 
 > **Worked example.** F = 1 L/min, S = 2.9, W = 0.45 L/min. In extraction, $S + L = 4.35$ L/min, so
 > $\tau_{mix} = 8/4.35 = 1.84$ min and $\tau_{set} = 40/4.35 = 9.20$ min. In scrub, $S + L = 3.35$ L/min, giving 2.39 and
-> 11.94 min. Hold-up is $20 \times 48 = 960$ L, and hold-up ÷ F = 16 h.
+> 11.94 min. Hold-up is $(n + m)(V_{mix} + V_{set}) = 20 \times 48 = 960$ L, and hold-up ÷ F = 16 h.
 
 **Residence-time distribution.** A perfectly mixed vessel has an exponential residence-time distribution,
 $E(t) = e^{-t/\tau}/\tau$. Real settlers are closer to **plug flow** (a dead time) with some back-mixing. The lab
@@ -2386,7 +2509,7 @@ control (B14), which the lab assumes is perfect.
 ### B6 · Mass-transfer rate and stage efficiency  → *Lab 6*
 Real stages do not reach equilibrium. From A1.6, transfer in the mixer is modelled as **first order**:
 
-$$\text{rate to organic} = V_o^{m}\,\frac{D\,x_m - y_m}{\tau_{mt}}$$
+$$\text{rate to organic} = V_o^{mix}\,\frac{D\,x^{mix} - y^{mix}}{\tau_{mt}}$$
 
 **Derivation of the approach to equilibrium.** Take any quantity $z$ in a well-mixed vessel. It enters at $z_{in}$, is
 washed out with residence time $\tau$, and relaxes towards equilibrium $z^*$ with time constant $\tau_{mt}$. At steady state
@@ -2401,19 +2524,21 @@ $\tau_{mt}$ grows. Larger mixers or more intense mixing raise $\eta$. Larger set
 the dynamics.
 
 ### B7 · The plant model, eigenvalues and numerical integration  → *Labs 6–10*
-Each stage has a mixer ($x_m, y_m$) and a settler ($x_s, y_s$) for each element. The aqueous enters mixer $n$ from settler
-$n+1$ plus the feed at stage $f$, and the organic enters from settler $n-1$:
+Each stage $i$ has a mixer ($x_i^{mix}, y_i^{mix}$) and a settler ($x_i^{set}, y_i^{set}$) for each element. The
+superscripts are spelled out because $m$ already means the number of scrub stages. The aqueous enters mixer $i$ from
+settler $i+1$, plus the feed at stage $n$, and the organic enters from settler $i-1$:
 
-$$V_a^{m}\dot x_m = L_{n+1}x_s^{(n+1)} + F c_F[n=f] - L_n x_m - V_o^{m}\,\frac{D x_m - y_m}{\tau_{mt}}$$
-$$V_o^{m}\dot y_m = S\,y_s^{(n-1)} - S\,y_m + V_o^{m}\,\frac{D x_m - y_m}{\tau_{mt}}$$
-$$V_a^{s}\dot x_s = L_n (x_m - x_s),\qquad V_o^{s}\dot y_s = S\,(y_m - y_s)$$
+$$V_a^{mix}\dot x_i^{mix} = L_{i+1}x_{i+1}^{set} + F c_F[i=n] - L_i x_i^{mix} - V_o^{mix}\,\frac{D_i x_i^{mix} - y_i^{mix}}{\tau_{mt}}$$
+$$V_o^{mix}\dot y_i^{mix} = S\,y_{i-1}^{set} - S\,y_i^{mix} + V_o^{mix}\,\frac{D_i x_i^{mix} - y_i^{mix}}{\tau_{mt}}$$
+$$V_a^{set}\dot x_i^{set} = L_i\,(x_i^{mix} - x_i^{set}),\qquad V_o^{set}\dot y_i^{set} = S\,(y_i^{mix} - y_i^{set})$$
 
-**State-space form.** Stacking the $4N$ states gives $M\dot u = -A\,u + b$, with $M$ the diagonal matrix of phase
+**State-space form.** Stacking the $4(n+m)$ states gives $M\dot u = -A\,u + b$, with $M$ the diagonal matrix of phase
 volumes. Its poles are the eigenvalues of $-M^{-1}A$ (B4).
 
-**Banded structure.** Ordering the unknowns $[x_m, y_m, x_s, y_s]$ stage by stage keeps every non-zero within six
-places of the diagonal (**half-bandwidth 6**): mixer $n$ couples to settler $n+1$ at offset +6 and to settler $n-1$ at
-offset −2. A banded LU factorisation costs $O(n\,k_l\,k_u)$ instead of $O(n^3)$. It needs no pivoting here because
+**Banded structure.** Ordering the unknowns $[x^{mix}, y^{mix}, x^{set}, y^{set}]$ stage by stage keeps every non-zero
+within six places of the diagonal (**half-bandwidth 6**): mixer $i$ couples to settler $i+1$ at offset +6 and to settler
+$i-1$ at offset −2. For a matrix of size $N_u = 4(n+m)$, a banded LU factorisation costs $O(N_u\,k_l\,k_u)$ instead of
+$O(N_u^3)$. It needs no pivoting here because
 the matrix is a diagonally dominant **M-matrix** (every outflow is at least as large as the matching inflows).
 
 **Stiffness and the choice of integrator.**
@@ -2835,7 +2960,7 @@ and control loop. Its conventions follow ISA-5.1:
   The lab treats both as perfect (B14, B17).
 
 **The stage symbols are live.** Each stage is drawn as a settler with its organic layer on top and its aqueous layer
-below. The bars show the light and heavy element concentrations leaving that stage. Change nExt or nScr in section 5 and the
+below. The bars show the light and heavy element concentrations leaving that stage. Change n or m in section 5 and the
 number of stages redraws. ▲/▼ marks stages whose metal content is still rising or falling by more than 2 % per hour.
 During start-up (B8) the arrows show the profile filling outward from the feed stage. After a disturbance (B15) they show
 the upset travelling through the cascade, and in closed loop the controller pulling it back.
@@ -2909,7 +3034,7 @@ def _(ELEMENTS, mo):
     sl_xF4 = mo.ui.slider(5, 80, 1, value=40, label="Feed (mmol/L)", show_value=True)
     sl_OA4 = mo.ui.slider(0.25, 4.0, 0.05, value=1.0, label="O/A", show_value=True)
     sl_pH4 = mo.ui.slider(1.5, 3.0, 0.05, value=2.3, label="pH", show_value=True)
-    sl_N4 = mo.ui.slider(1, 8, 1, value=3, label="Stages N", show_value=True)
+    sl_N4 = mo.ui.slider(1, 8, 1, value=3, label="Stages n", show_value=True)
     sl_C4 = mo.ui.slider(0.1, 1.0, 0.05, value=0.5, label="Extractant C (mol/L)", show_value=True)
     return (
         dd_el4,
@@ -2939,15 +3064,18 @@ def _(PAIR_DEFAULTS, mo):
 def _(CF_DEFAULT, PAIR_DEFAULTS, dd_pair, mo):
     # Re-created whenever the pair changes, so every slider jumps to that pair's defaults.
     _d = PAIR_DEFAULTS[dd_pair.value]
-    sl_next = mo.ui.slider(1, 30, 1, value=_d["n_ext"], label="nExt", show_value=True, debounce=True)
-    sl_nscr = mo.ui.slider(1, 30, 1, value=_d["n_scr"], label="nScr", show_value=True, debounce=True)
+    sl_next = mo.ui.slider(1, 30, 1, value=_d["n_ext"], label="n (extraction stages)", show_value=True, debounce=True)
+    sl_nscr = mo.ui.slider(1, 30, 1, value=_d["n_scr"], label="m (scrub stages)", show_value=True, debounce=True)
     sl_S = mo.ui.slider(0.5, 6.0, 0.05, value=_d["S"], label="S (per unit F)", show_value=True, debounce=True)
     sl_W = mo.ui.slider(0.05, 3.0, 0.05, value=_d["W"], label="W (per unit F)", show_value=True, debounce=True)
     sl_pHe = mo.ui.slider(0.5, 3.5, 0.05, value=_d["pH_ext"], label="pH extraction", show_value=True, debounce=True)
     sl_pHs = mo.ui.slider(0.5, 3.5, 0.05, value=_d["pH_scr"], label="pH scrub", show_value=True, debounce=True)
     sl_cF = mo.ui.slider(10, 300, 5, value=CF_DEFAULT, label="Feed total (mmol/L)", show_value=True, debounce=True)
     sl_fh = mo.ui.slider(0.1, 0.9, 0.05, value=0.5, label="Feed heavy fraction", show_value=True, debounce=True)
-    return sl_S, sl_W, sl_cF, sl_fh, sl_next, sl_nscr, sl_pHe, sl_pHs
+    _l, _h = dd_pair.value.split("|")
+    dd_mt = mo.ui.dropdown({f"{_h} (heavy)": _h, f"{_l} (light)": _l}, value=f"{_h} (heavy)",
+                           label="McCabe–Thiele element")
+    return dd_mt, sl_S, sl_W, sl_cF, sl_fh, sl_next, sl_nscr, sl_pHe, sl_pHs
 
 
 @app.cell(hide_code=True)
@@ -3125,14 +3253,14 @@ def _(
             _ax.axhline(100 * _E, color=COLORS[_el], lw=1, ls="--")
         _ax.annotate(f"{_el} (E={_E:.3g})", (_N[-1], _rec[-1]), xytext=(4, 0), textcoords="offset points",
                      fontsize=8, color=INK, va="center")
-        _rows.append({"Element": _el, "E": float(f"{_E:.4g}"), "N=1 (%)": round(float(_rec[1]), 2),
-                      "N=5 (%)": round(float(_rec[5]), 2), "N=20 (%)": round(float(_rec[20]), 2),
-                      "Ceiling N→∞ (%)": round(100 * float(kremser_ceiling(_E)), 2)})
+        _rows.append({"Element": _el, "E": float(f"{_E:.4g}"), "n=1 (%)": round(float(_rec[1]), 2),
+                      "n=5 (%)": round(float(_rec[5]), 2), "n=20 (%)": round(float(_rec[20]), 2),
+                      "Ceiling n→∞ (%)": round(100 * float(kremser_ceiling(_E)), 2)})
     _ax.set_xlim(0, 24)
     _ax.set_ylim(0, 102)
-    label_axes(_ax, "Counter-current recovery (dashed = E < 1 ceiling)", "Number of stages N", "% extracted")
+    label_axes(_ax, "Counter-current recovery (dashed = E < 1 ceiling)", "Number of stages n", "% extracted")
     mo.vstack([
-        mo.md("### 3 · Kremser recovery vs stages\nFraction left in the raffinate: (E−1)/(E^(N+1)−1), with E = D·O/A."),
+        mo.md("### 3 · Kremser recovery vs stages\nFraction left in the raffinate after n stages: x₁/x_F = (E−1)/(E^(n+1)−1), with E = D·O/A (Background A6)."),
         mo.hstack([sl_pH3, sl_OA3], justify="start", gap=1.5, wrap=True),
         ms_els3,
         _fig,
@@ -3168,39 +3296,44 @@ def _(
     _el, _xF, _OA, _N = dd_el4.value, float(sl_xF4.value), sl_OA4.value, sl_N4.value
     _D = float(distribution_ratio(_el, sl_pH4.value, sl_C4.value))
     _Q = 1000 * sl_C4.value / 6
-    _xN, _xs, _ys = mccabe_thiele(_xF, _D, _OA, _N, _Q)
+    # stages i = 1..n from the raffinate end: xs = [x_1..x_{n+1}=x_F], ys = [y_1..y_n]
+    _x1, _xs, _ys = mccabe_thiele(_xF, _D, _OA, _N, _Q)
     _fig, (_ax,) = new_figure(1, 7.5, 4.2)
     _xx = np.linspace(0, _xF * 1.05, 300)
     _ax.plot(_xx, isotherm(_xx, _D, _Q), color=COLORS[_el], lw=2)
-    _xl = min(_xF * 0.5, _xs[-2] if len(_xs) > 1 else _xF) * 0.35
-    _ax.annotate(f"isotherm, {_el}", (_xl, isotherm(_xl, _D, _Q)), xytext=(6, 0),
+    _xl = min(_xF * 0.5, _xs[1] if len(_xs) > 1 else _xF) * 0.35
+    _ax.annotate(f"equilibrium (isotherm), {_el}", (_xl, isotherm(_xl, _D, _Q)), xytext=(6, 0),
                  textcoords="offset points", ha="left", fontsize=8, color=INK)
-    _ax.plot([_xN, _xF], [0, (_xF - _xN) / _OA], color=INK2, lw=2)
-    _ax.annotate("operating line", (_xF, (_xF - _xN) / _OA), xytext=(-4, -12), textcoords="offset points",
-                 ha="right", fontsize=8, color=INK)
-    # stair steps: from (x0, y1) across to the isotherm, then down to the operating line
-    _sx, _sy = [_xF], [_ys[-1]]
-    _x_seq = _xs[::-1]  # x0, x1, ..., xN
-    _y_seq = _ys[::-1]  # y1, ..., yN
-    for _n in range(_N):
-        _sx.append(_x_seq[_n + 1]); _sy.append(_y_seq[_n])
-        _next_y = _y_seq[_n + 1] if _n + 1 < _N else 0.0
-        _sx.append(_x_seq[_n + 1]); _sy.append(_next_y)
+    # operating line  y = (A/O)(x - x_1)  from (x_1, 0) to (x_F, y_n)
+    _ax.plot([_x1, _xF], [0, (_xF - _x1) / _OA], color=INK2, lw=2)
+    _ax.annotate(f"operating line y = {1 / _OA:.3g}(x − {_x1:.3g})", (_xF, (_xF - _x1) / _OA), xytext=(-4, -12),
+                 textcoords="offset points", ha="right", fontsize=8, color=INK)
+    # staircase: (x_1, 0) -> (x_1, y_1) -> (x_2, y_1) -> (x_2, y_2) -> ... -> (x_{n+1} = x_F, y_n)
+    _sx, _sy = [_x1, _x1], [0.0, _ys[0]]
+    for _i in range(1, _N + 1):
+        _sx.append(_xs[_i]); _sy.append(_ys[_i - 1])            # across to the operating line
+        if _i < _N:
+            _sx.append(_xs[_i]); _sy.append(_ys[_i])            # up to the isotherm: stage i+1
     _ax.plot(_sx, _sy, color=ACCENT1, lw=1.5)
-    for _n in range(_N):
-        _ax.annotate(str(_n + 1), (_x_seq[_n + 1], _y_seq[_n]), xytext=(-8, 3), textcoords="offset points",
+    for _i in range(_N):
+        _ax.annotate(str(_i + 1), (_xs[_i], _ys[_i]), xytext=(-8, 3), textcoords="offset points",
                      fontsize=8, color=INK)
     _ax.axhline(_Q, color=INK2, lw=1, ls=":")
     _ax.annotate(f"Q = C/6 = {_Q:.1f}", (0, _Q), xytext=(4, -10), textcoords="offset points", fontsize=8, color=INK2)
     _ax.set_xlim(0, _xF * 1.05)
     _ax.set_ylim(0, min(_Q * 1.08, max(_ys) * 1.25 + 1))
-    label_axes(_ax, f"{_el}: D = {_D:.4g}, O/A = {_OA}, {_N} stages", "Aqueous x (mmol/L)", "Organic y (mmol/L)")
-    _table = [{"N": _k, "Raffinate x_N (mmol/L)": float(f"{mccabe_thiele(_xF, _D, _OA, _k, _Q)[0]:.4g}")}
+    label_axes(_ax, f"{_el}: D = {_D:.4g}, O/A = {_OA}, n = {_N} stages (stage 1 = raffinate end)",
+               "Aqueous x (mmol/L)", "Organic y (mmol/L)")
+    _table = [{"n": _k, "Raffinate x_1 (mmol/L)": float(f"{mccabe_thiele(_xF, _D, _OA, _k, _Q)[0]:.4g}")}
               for _k in range(1, 9)]
     mo.vstack([
         mo.md("### 4 · McCabe–Thiele with stair steps\n"
-              f"Raffinate **{_xN:.4g} mmol/L**, recovery **{100 * (1 - _xN / _xF):.2f} %** "
-              "(the raffinate is found by bisection)."),
+              f"Raffinate **x₁ = {_x1:.4g} mmol/L**, recovery **{100 * (1 - _x1 / _xF):.2f} %**. "
+              "The raffinate is found by bisection.\n\n"
+              f"**Equilibrium line:** $y = D x/(1 + D x/Q)$ with $D$ = {_D:.4g} and $Q$ = {_Q:.1f} mmol/L.  \n"
+              f"**Operating line** (balance around stages 1…i, Background A7): $O\\,y_i = A\\,(x_{{i+1}} - x_1)$, so "
+              f"$y = (A/O)(x - x_1)$ = **{1 / _OA:.3g} (x − {_x1:.4g})**. It runs from the raffinate end "
+              f"$(x_1, 0)$ to the feed end $(x_F, y_n)$ = ({_xF:.0f}, {(_xF - _x1) / _OA:.2f})."),
         mo.hstack([dd_el4, sl_xF4, sl_OA4], justify="start", gap=1.5, wrap=True),
         mo.hstack([sl_pH4, sl_N4, sl_C4], justify="start", gap=1.5, wrap=True),
         mo.hstack([_fig, mo.ui.table(_table, selection=None)], widths=[3, 1]),
@@ -3233,10 +3366,13 @@ def _(
 
 @app.cell(hide_code=True)
 def _(
+    ACCENT1,
     COLORS,
     INK,
     INK2,
     cas,
+    cascade_operating_lines,
+    dd_mt,
     dd_pair,
     fenske_nmin,
     label_axes,
@@ -3267,9 +3403,52 @@ def _(
         _ax.axvline(cas["n_ext"], color=INK2, lw=1, ls="--")
         _ax.annotate("feed", (cas["n_ext"], 0), xytext=(3, 3), textcoords="offset points", fontsize=8, color=INK2)
         _ax.set_xlim(0.5, cas["N"] + 1.5)
-        label_axes(_ax, _title + " (shaded = scrub)", "Stage (1 = raffinate end)", _yl)
+        label_axes(_ax, _title + " (shaded = scrub)", "Stage i (1 = raffinate end; n = feed)", _yl)
     _axes[1].axhline(cas["Q"], color=INK2, lw=1, ls=":")
     _beta = separation_factor(_h, _l)
+    # McCabe-Thiele construction for the chosen element
+    _op = cascade_operating_lines(cas, dd_mt.value, sl_S.value, sl_W.value, 1.0)
+    _mt_fig, (_mx,) = new_figure(1, 9.5, 4.4)
+    _xmax = max(_op["x"].max(), _op["cF"]) * 1.08
+    _xe = np.linspace(0, _xmax, 50)
+    _mx.plot(_xe, _op["D_ext"] * _xe, color=COLORS[dd_mt.value], lw=2)
+    _mx.plot(_xe, _op["D_scr"] * _xe, color=COLORS[dd_mt.value], lw=2, ls="--")
+    # place the equilibrium labels part-way along each line, inside the plotted y-range
+    _ytop = max(_op["y"].max(), _op["yP"]) * 1.25
+    _xl_e = min(_xmax * 0.95, 0.85 * _ytop / max(_op["D_ext"], 1e-9))
+    _xl_s = min(_xmax * 0.55, 0.85 * _ytop / max(_op["D_scr"], 1e-9))
+    _mx.annotate(f"equilibrium, extraction pH: y = {_op['D_ext']:.3f} x", (_xl_e, _op["D_ext"] * _xl_e),
+                 xytext=(-6, 4), textcoords="offset points", ha="right", fontsize=8, color=INK)
+    _mx.annotate(f"equilibrium, scrub pH: y = {_op['D_scr']:.3f} x", (_xl_s, _op["D_scr"] * _xl_s),
+                 xytext=(6, -14), textcoords="offset points", ha="left", fontsize=8, color=INK)
+    # each operating line is drawn over the x-range its passing-stream pairs actually use
+    _x_ext_hi = max(_op["cF"], float(_op["x"][:_op["n"]].max()))
+    _x_scr_hi = max(_op["cF"], float(_op["x"][_op["n"]:].max()))
+    _xo1 = np.linspace(_op["x1"], _x_ext_hi, 2)
+    _mx.plot(_xo1, _op["ext_slope"] * (_xo1 - _op["x1"]), color=INK, lw=2)
+    _xo2 = np.linspace(0, _x_scr_hi, 2)
+    _mx.plot(_xo2, _op["scr_slope"] * _xo2 + _op["yP"], color=INK2, lw=2)
+    _yc = _op["scr_slope"] * _op["cF"] + _op["yP"]
+    _mx.plot([_op["cF"]], [_yc], "o", ms=7, color=INK, mec="white", mew=1.5)
+    _mx.annotate("lines cross at x = c_F", (_op["cF"], _yc), xytext=(6, 6), textcoords="offset points",
+                 fontsize=8, color=INK)
+    _mx.annotate("extraction operating line", (_x_ext_hi, _op["ext_slope"] * (_x_ext_hi - _op["x1"])),
+                 xytext=(6, -14), textcoords="offset points", fontsize=8, color=INK)
+    _mx.annotate("scrub operating line", (0, _op["yP"]), xytext=(4, 6), textcoords="offset points",
+                 fontsize=8, color=INK)
+    _mx.axvline(_op["cF"], color=INK2, lw=1, ls=":")
+    _mx.annotate("feed line x = c_F", (_op["cF"], 0), xytext=(4, 4), textcoords="offset points", fontsize=8,
+                 color=INK2)
+    _mx.plot(_op["stair_x"], _op["stair_y"], color=ACCENT1, lw=1.2)
+    _every = max(1, _op["N"] // 10)
+    for _i in range(_op["N"]):
+        if _i % _every == 0 or _i + 1 in (_op["n"], _op["N"]):
+            _mx.annotate(str(_i + 1), (_op["x"][_i], _op["y"][_i]), xytext=(-9, 2), textcoords="offset points",
+                         fontsize=7, color=INK)
+    _mx.set_xlim(0, _xmax)
+    _mx.set_ylim(0, max(_op["y"].max(), _op["yP"]) * 1.25)
+    label_axes(_mx, f"{dd_mt.value}: stages 1…{_op['n']} extraction, {_op['n'] + 1}…{_op['N']} scrub "
+               "(numbers = stage i at equilibrium)", "Aqueous x (mmol/L)", "Organic y (mmol/L)")
     _efac = [{"Section": _sec, f"E {_l} (light)": round(float(sl_S.value * cas[_l]["D"][_i] / cas["L"][_i]), 3),
               f"E {_h} (heavy)": round(float(sl_S.value * cas[_h]["D"][_i] / cas["L"][_i]), 3)}
              for _sec, _i in (("Extraction", 0), ("Scrub", cas["N"] - 1))]
@@ -3292,6 +3471,17 @@ def _(
         _warn,
         mo.ui.table(_efac, selection=None, label="Extraction factors E = S·D/L (separation needs heavy > 1 > light)"),
         _fig,
+        mo.md("#### McCabe–Thiele diagram of the cascade\n"
+              "Operating lines from mass balances around each end of the cascade (Background, A8):  \n"
+              f"**Extraction section** (stages 1…n): $S\\,y_i = (W+F)(x_{{i+1}} - x_1)$, so "
+              f"$y$ = **{_op['ext_slope']:.3f} (x − {_op['x1']:.3g})**  \n"
+              f"**Scrub section** (stages n+1…n+m): $S\\,y_{{i-1}} = W x_i + S\\,y_{{n+m}}$, so "
+              f"$y$ = **{_op['scr_slope']:.3f} x + {_op['yP']:.3g}**  \n"
+              f"Both lines cross on the **feed line** $x = c_F$ = {_op['cF']:.1f} mmol/L (computed crossing "
+              f"{_op['x_cross']:.2f}). Every computed stage satisfies its operating line to within "
+              f"{_op['residual']:.1e} mmol/min."),
+        dd_mt,
+        _mt_fig,
     ])
     return
 
@@ -3848,7 +4038,7 @@ def _(
                    _label, stage_trend(_u, _prev, _dt_h))
     mo.vstack([
         mo.md("### 11 · Interactive P&ID\n"
-              f"The cascade from section 5 ({plant['N']} stages: {plant['n_ext']} extraction + {plant['n_scr']} scrub) "
+              f"The cascade from section 5 (n + m = {plant['n_ext']} + {plant['n_scr']} = {plant['N']} stages) "
               "drawn as a piping and instrumentation diagram. Bars show the settler concentrations of each element "
               "in the organic (top) and aqueous (bottom) layer of every stage. **Hover over a stage** for exact "
               "values. Choose a scenario, then drag the time slider or press **Play**. The disturbance, controller mode, tuning, "
