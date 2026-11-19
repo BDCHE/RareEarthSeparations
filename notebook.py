@@ -8,7 +8,7 @@
 # ///
 """Rare Earth Separation Lab: a four-page marimo notebook.
 
-Pages: 1 Concepts and governing equations, 2 Interactive lab, 3 Python code,
+Pages: 1 Background, 2 Interactive lab, 3 Python code,
 4 Attribution. Only marimo, numpy and matplotlib are used so the notebook runs
 unchanged in molab and in a WebAssembly (Pyodide) export.
 """
@@ -40,7 +40,7 @@ def _(mo):
     # The four pages, in order. The tab bar is created once in its own cell so
     # that the selected page survives every re-run of the lab cells.
     PAGES = [
-        "1 · Concepts and governing equations",
+        "1 · Background",
         "2 · Interactive lab",
         "3 · Python code",
         "4 · Attribution",
@@ -793,6 +793,8 @@ def _(
     separation_factor,
     simc_tuning,
     simulate_disturbance,
+    cascade_overview_svg,
+    mixer_settler_detail_svg,
     pid_svg,
     simulate_startup,
     stability_margins,
@@ -943,6 +945,16 @@ def _(
         check("stage trend: every stage is filling 1.5–2 h into start-up (count of ▲)", 20.0,
               float(np.sum(tr == 1)), 0.0)
 
+        # Figure A1 diagrams are well-formed SVG (XML)
+        import xml.etree.ElementTree as _ET
+        _ok = 1.0
+        for _svg in (mixer_settler_detail_svg(), cascade_overview_svg(), svg20):
+            try:
+                _ET.fromstring(_svg)
+            except _ET.ParseError:
+                _ok = 0.0
+        check("mixer-settler diagrams and P&ID parse as valid SVG (1 = yes)", 1.0, _ok, 0.0)
+
         # actuator limits and anti-windup: a +/-20 % limit forces saturation
         hard = simulate_disturbance(plant, "Extraction pH −0.05", True, LG=5.0, Ti=30.0,
                                     delay=10.0, limit=0.2)
@@ -953,6 +965,183 @@ def _(
         return results
 
     return (run_tests,)
+
+
+@app.cell
+def _():
+    # ------------------------------------------- mixer-settler connection diagrams
+    # Two static SVG figures for the Background page:
+    #   (a) three neighbouring mixer-settlers, showing how organic moves forward
+    #       (to stage n+1) and aqueous moves back (to stage n-1);
+    #   (b) the whole extraction/scrub cascade with stage and stream names.
+    ORG_LINE, AQ_LINE = "#b4521f", "#2a78d6"      # organic / aqueous stream colours
+    ORG_FILL, AQ_FILL = "#f4efe1", "#e7eff6"      # organic / aqueous phase fills
+    INK_D, INK2_D = "#0b0b0b", "#52514e"
+
+    def _svg_open(w, h, label):
+        return [f'<svg viewBox="0 0 {w} {h}" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" '
+                f'aria-label="{label}" font-family="Inter, Helvetica, Arial, sans-serif">',
+                f'<rect width="{w}" height="{h}" fill="#fcfcfb"/>',
+                '<defs>'
+                f'<marker id="ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{ORG_LINE}"/></marker>'
+                f'<marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{AQ_LINE}"/></marker>'
+                f'<marker id="ak" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{INK_D}"/></marker>'
+                '<pattern id="disp" width="6" height="6" patternUnits="userSpaceOnUse">'
+                f'<rect width="6" height="6" fill="{AQ_FILL}"/><circle cx="3" cy="3" r="1.6" fill="{ORG_FILL}" stroke="{INK2_D}" stroke-width="0.3"/></pattern>'
+                '</defs>']
+
+    def _t(x, y, txt, size=11, anchor="middle", col=INK_D, weight="normal"):
+        """Text; '_{...}' becomes a subscript."""
+        import re as _re
+        parts = _re.split(r"_\{([^}]*)\}", txt)
+        body = "".join(p if i % 2 == 0 else f'<tspan baseline-shift="sub" font-size="{size * 0.75:.1f}">{p}</tspan>'
+                       for i, p in enumerate(parts))
+        return (f'<text x="{x}" y="{y}" font-size="{size}" text-anchor="{anchor}" fill="{col}" '
+                f'font-weight="{weight}">{body}</text>')
+
+    def _path(d, col, marker, width=2.2, dash=None):
+        da = f' stroke-dasharray="{dash}"' if dash else ""
+        return f'<path d="{d}" fill="none" stroke="{col}" stroke-width="{width}"{da} marker-end="url(#{marker})"/>'
+
+    def mixer_settler_detail_svg():
+        """Panel (a): stages n-1, n, n+1 as mixer + settler units with all connections."""
+        W, H = 1100, 410
+        o = _svg_open(W, H, "Three neighbouring mixer-settler stages and their connections")
+        o.append(_t(20, 26, "(a) How neighbouring mixer-settlers are connected", 14, "start", weight="600"))
+        top, bot = 130, 230                        # vertical extent of units
+        mid = (top + bot) / 2                      # nominal interface in the settler
+        units = [(60, "n−1", "n−2", "n"), (420, "n", "n−1", "n+1"), (780, "n+1", "n", "n+2")]
+        mw, sw = 70, 230                           # mixer width, settler width
+        for x, name, prev, nxt in units:
+            mx, sx = x, x + mw + 10                # mixer, settler left edges
+            # mixer with impeller
+            o.append(f'<rect x="{mx}" y="{top}" width="{mw}" height="{bot - top}" fill="url(#disp)" stroke="{INK_D}" stroke-width="1.5"/>')
+            o.append(f'<line x1="{mx + mw / 2}" y1="{top - 25}" x2="{mx + mw / 2}" y2="{bot - 30}" stroke="{INK_D}" stroke-width="2"/>')
+            o.append(f'<path d="M{mx + 15},{bot - 30} L{mx + mw - 15},{bot - 30} M{mx + 15},{bot - 38} L{mx + 15},{bot - 22} '
+                     f'M{mx + mw - 15},{bot - 38} L{mx + mw - 15},{bot - 22}" stroke="{INK_D}" stroke-width="2.5" fill="none"/>')
+            o.append(f'<rect x="{mx + mw / 2 - 12}" y="{top - 40}" width="24" height="15" fill="#ffffff" stroke="{INK_D}"/>')
+            o.append(_t(mx + mw / 2, top - 29, "M", 9))
+            o.append(_t(mx + mw / 2, bot + 18, f"Mixer {name}", 11, weight="600"))
+            # dispersion flows from mixer into settler
+            o.append(f'<rect x="{mx + mw}" y="{mid - 10}" width="10" height="20" fill="url(#disp)" stroke="{INK_D}" stroke-width="1"/>')
+            # settler: dispersion band near the inlet, organic layer on top, aqueous below
+            o.append(f'<rect x="{sx}" y="{top}" width="{sw}" height="{mid - top}" fill="{ORG_FILL}" stroke="none"/>')
+            o.append(f'<rect x="{sx}" y="{mid}" width="{sw}" height="{bot - mid}" fill="{AQ_FILL}" stroke="none"/>')
+            o.append(f'<path d="M{sx},{mid - 22} L{sx + 90},{mid - 4} L{sx + 90},{mid + 4} L{sx},{mid + 22} Z" fill="url(#disp)" stroke="{INK2_D}" stroke-width="0.6"/>')
+            o.append(f'<line x1="{sx + 90}" y1="{mid}" x2="{sx + sw - 30}" y2="{mid}" stroke="{INK2_D}" stroke-width="1" stroke-dasharray="4,3"/>')
+            o.append(f'<rect x="{sx}" y="{top}" width="{sw}" height="{bot - top}" fill="none" stroke="{INK_D}" stroke-width="1.5"/>')
+            # organic overflow weir (top right) and aqueous underflow weir (bottom right)
+            o.append(f'<line x1="{sx + sw - 30}" y1="{top}" x2="{sx + sw - 30}" y2="{mid - 18}" stroke="{INK_D}" stroke-width="1.5"/>')
+            o.append(f'<line x1="{sx + sw - 30}" y1="{mid + 8}" x2="{sx + sw - 30}" y2="{bot}" stroke="{INK_D}" stroke-width="1.5"/>')
+            o.append(f'<line x1="{sx + sw - 15}" y1="{mid - 2}" x2="{sx + sw - 15}" y2="{bot - 12}" stroke="{INK_D}" stroke-width="1.5"/>')
+            o.append(_t(sx + 120, top + 18, f"organic  y_{{{name}}}", 10, col=INK2_D))
+            o.append(_t(sx + 150, bot - 10, f"aqueous  x_{{{name}}}", 10, col=INK2_D))
+            o.append(_t(sx + sw / 2, bot + 18, f"Settler {name}", 11, weight="600"))
+            # organic leaves over the weir -> mixer of the NEXT stage (forward, above the units)
+            ox_out = sx + sw
+            nx_mixer = x + 360 + mw / 2 - 18      # inlet point on the next mixer's top
+            o.append(_path(f"M{ox_out},{top + 14} L{ox_out + 18},{top + 14} L{ox_out + 18},{top - 55} "
+                           f"L{nx_mixer},{top - 55} L{nx_mixer},{top}", ORG_LINE, "ao"))
+            # aqueous leaves under the weir -> mixer of the PREVIOUS stage (backward, below the units)
+            lane = bot + 50 if name != "n" else bot + 75
+            px = x - 360 - 16                      # just left of the previous mixer
+            o.append(_path(f"M{ox_out},{bot - 8} L{ox_out + 8},{bot - 8} L{ox_out + 8},{lane} "
+                           f"L{px},{lane} L{px},{bot - 18} L{px + 14},{bot - 18}", AQ_LINE, "aa"))
+        # clip the off-panel ends and label them
+        o.append(f'<rect x="0" y="40" width="40" height="{H - 40}" fill="#fcfcfb"/>')
+        o.append(f'<rect x="{W - 30}" y="40" width="30" height="{H - 40}" fill="#fcfcfb"/>')
+        o.append(_path(f"M8,{top - 55} L{60 + mw / 2 - 18},{top - 55} L{60 + mw / 2 - 18},{top}", ORG_LINE, "ao"))
+        o.append(_t(8, top - 62, "organic y_{n−2} from settler n−2", 10, "start", ORG_LINE))
+        o.append(_t(W - 8, top - 62, "to mixer n+2", 10, "end", ORG_LINE))
+        o.append(_path(f"M{W - 8},{bot + 75} L{780 - 16},{bot + 75} L{780 - 16},{bot - 18} L{780 - 2},{bot - 18}", AQ_LINE, "aa"))
+        o.append(_t(W - 8, bot + 92, "aqueous x_{n+2} from settler n+2", 10, "end", AQ_LINE))
+        o.append(_t(44, bot + 40, "to mixer n−2", 10, "start", AQ_LINE))
+        # one label per stream, on its own line
+        o.append(_t(455, 64, "organic y_{n−1}: settler n−1 → mixer n", 10, "middle", ORG_LINE))
+        o.append(_t(815, 64, "organic y_{n}: settler n → mixer n+1", 10, "middle", ORG_LINE))
+        o.append(_t(250, bot + 92, "← aqueous x_{n}: settler n → mixer n−1 (underflow)", 10, "middle", AQ_LINE))
+        o.append(_t(930, bot + 40, "← aqueous x_{n+1}: settler n+1 → mixer n", 10, "middle", AQ_LINE))
+        # legend
+        ly = H - 22
+        o.append(f'<rect x="20" y="{ly - 10}" width="14" height="12" fill="url(#disp)" stroke="{INK2_D}" stroke-width="0.5"/>')
+        o.append(_t(40, ly, "dispersion (droplets)", 10, "start", INK2_D))
+        o.append(f'<line x1="190" y1="{ly - 4}" x2="220" y2="{ly - 4}" stroke="{ORG_LINE}" stroke-width="2.2"/>')
+        o.append(_t(226, ly, "organic stream (moves to higher stage numbers)", 10, "start", INK2_D))
+        o.append(f'<line x1="520" y1="{ly - 4}" x2="550" y2="{ly - 4}" stroke="{AQ_LINE}" stroke-width="2.2"/>')
+        o.append(_t(556, ly, "aqueous stream (moves to lower stage numbers)", 10, "start", INK2_D))
+        o.append(_t(1080, ly, "M = agitator motor · vertical bars = weirs", 10, "end", INK2_D))
+        o.append("</svg>")
+        return "".join(o)
+
+    def cascade_overview_svg(n_ext_label="n_{Ext}", example=""):
+        """Panel (b): the whole cascade with stage numbers, sections and every stream."""
+        W, H = 1100, 490
+        o = _svg_open(W, H, "Extraction and scrub cascade with stage and stream names")
+        o.append(_t(20, 26, "(b) The extraction / scrub cascade: stages and streams", 14, "start", weight="600"))
+        labels = ["1", "2", "…", "f = n_{Ext}", "f + 1", "…", "N"]
+        sect = ["E", "E", "E", "E", "S", "S", "S"]
+        x0, pitch, bw = 170, 115, 84
+        top, bot = 175, 285
+        mid = (top + bot) / 2
+        yo, ya = top + 28, bot - 28
+        xs = [x0 + i * pitch for i in range(len(labels))]
+        for x, lab, sc in zip(xs, labels, sect):
+            if lab == "…":
+                o.append(_t(x + bw / 2, mid + 5, "· · ·", 18, col=INK2_D))
+                continue
+            o.append(f'<rect x="{x}" y="{top}" width="{bw}" height="{mid - top}" fill="{ORG_FILL}" stroke="{INK_D}" stroke-width="1.3"/>')
+            o.append(f'<rect x="{x}" y="{mid}" width="{bw}" height="{bot - mid}" fill="{AQ_FILL}" stroke="{INK_D}" stroke-width="1.3"/>')
+            o.append(_t(x + bw / 2, bot + 18, f"Stage {lab}", 11, weight="600"))
+            o.append(_t(x + bw / 2, top + 16, "organic", 9, col=INK2_D))
+            o.append(_t(x + bw / 2, bot - 8, "aqueous", 9, col=INK2_D))
+        # inter-stage arrows: organic forward on top, aqueous backward below
+        for i in range(len(xs) - 1):
+            a, b = xs[i] + bw, xs[i + 1]
+            o.append(_path(f"M{a},{yo} L{b - 2},{yo}", ORG_LINE, "ao", 2))
+            o.append(_path(f"M{b},{ya} L{a + 2},{ya}", AQ_LINE, "aa", 2))
+        # section brackets
+        for i0, i1, t1, t2, shift in ((0, 3, "Extraction section: stages 1 … n_{Ext} (pH_{ext})", "aqueous flow L = W + F", -40),
+                                      (4, 6, "Scrub section: stages n_{Ext}+1 … N (pH_{scr})", "aqueous flow L = W", 0)):
+            xa, xb = xs[i0], xs[i1] + bw
+            o.append(f'<path d="M{xa},{top - 40} L{xa},{top - 48} L{xb},{top - 48} L{xb},{top - 40}" fill="none" stroke="{INK2_D}"/>')
+            o.append(_t((xa + xb) / 2 + shift, top - 70, t1, 11))
+            o.append(_t((xa + xb) / 2 + shift, top - 55, t2, 10, col=INK2_D))
+        # feed into stage f
+        xf = xs[3] + bw / 2
+        o.append(_path(f"M{xf},{top - 120} L{xf},{top - 2}", INK_D, "ak", 2.4))
+        o.append(_t(xf + 8, top - 112, "Feed F, c_{F} (light + heavy rare earths, aqueous)", 11, "start", weight="600"))
+        # left end: fresh solvent in (organic), raffinate out (aqueous)
+        o.append(_path(f"M20,{yo} L{xs[0] - 2},{yo}", ORG_LINE, "ao", 2.6))
+        o.append(_t(20, yo - 10, "Fresh (barren) organic S", 11, "start", ORG_LINE, "600"))
+        o.append(_path(f"M{xs[0]},{ya} L20,{ya}", AQ_LINE, "aa", 2.6))
+        o.append(_t(20, ya + 20, "Raffinate", 11, "start", AQ_LINE, "600"))
+        o.append(_t(20, ya + 34, "light product, flow W + F", 10, "start", INK2_D))
+        # right end: loaded organic out, scrub liquor in
+        xr = xs[-1] + bw
+        o.append(_path(f"M{xr},{yo} L{W - 20},{yo}", ORG_LINE, "ao", 2.6))
+        o.append(_t(W - 20, yo - 10, "Loaded organic (extract)", 11, "end", ORG_LINE, "600"))
+        o.append(_t(W - 20, yo + 18, "heavy product, flow S", 10, "end", INK2_D))
+        o.append(_path(f"M{W - 20},{ya} L{xr + 2},{ya}", AQ_LINE, "aa", 2.6))
+        o.append(_t(W - 20, ya + 20, "Scrub liquor W", 11, "end", AQ_LINE, "600"))
+        o.append(_t(W - 20, ya + 34, "dilute acid", 10, "end", INK2_D))
+        # solvent loop through stripping (not modelled), dashed
+        ys_ = bot + 95
+        o.append(_path(f"M{xr + 22},{yo} L{xr + 22},{ys_} L{W - 230},{ys_}", ORG_LINE, "ao", 1.6, "6,4"))
+        o.append(f'<rect x="{W - 400}" y="{ys_ - 22}" width="170" height="44" fill="#ffffff" stroke="{INK2_D}" stroke-dasharray="6,4"/>')
+        o.append(_t(W - 315, ys_ - 4, "Stripping (strong acid)", 11))
+        o.append(_t(W - 315, ys_ + 12, "not modelled", 9, col=INK2_D))
+        o.append(_path(f"M{W - 400},{ys_} L150,{ys_} L150,{yo + 4}", ORG_LINE, "ao", 1.6, "6,4"))
+        o.append(_t(240, ys_ - 8, "regenerated organic recycled to stage 1 (solvent loop, not modelled)", 10, "start", ORG_LINE))
+        o.append(_path(f"M{W - 370},{ys_ + 60} L{W - 370},{ys_ + 24}", INK2_D, "ak", 1.4, "4,3"))
+        o.append(_t(W - 378, ys_ + 56, "strip acid in", 9, "end", INK2_D))
+        o.append(_path(f"M{W - 260},{ys_ + 24} L{W - 260},{ys_ + 60}", INK2_D, "ak", 1.4, "4,3"))
+        o.append(_t(W - 252, ys_ + 56, "heavy-element strip liquor → precipitation", 9, "start", INK2_D))
+        if example:
+            o.append(_t(20, H - 10, example, 10, "start", INK2_D))
+        o.append("</svg>")
+        return "".join(o)
+
+    return cascade_overview_svg, mixer_settler_detail_svg
 
 
 @app.cell
@@ -1181,14 +1370,14 @@ def _(Figure):
 
 
 # ============================================================================
-# PAGE 1: Concepts and governing equations
+# PAGE 1: Background
 # ============================================================================
 @app.cell(hide_code=True)
 def _(PAGES, mo, nav):
     mo.stop(nav.value != PAGES[0])
     mo.md(
         r"""
-## 1 · Concepts and governing equations
+## 1 · Background
 
 This page is written as a short textbook in two parts of equal weight.
 
@@ -1344,7 +1533,56 @@ The models in this lab assume perfect phase separation, so none of these effects
 | Pulsed or agitated column | Minutes | Medium | Nuclear reprocessing, some metals; small floor area |
 | Centrifugal contactor | Seconds | Very small | Nuclear and research; fast, low inventory, but costly |
 
-#### A1.9 A complete SX circuit
+"""
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(PAGES, cascade_overview_svg, mixer_settler_detail_svg, mo, nav):
+    mo.stop(nav.value != PAGES[0])
+    mo.vstack([
+        mo.md(r"""
+#### A1.9 How the mixer-settlers are connected: stage and stream names
+**Figure A1** shows the plant in two views. **(a)** zooms in on three neighbouring stages. In each stage the agitated
+**mixer** disperses the two phases and pumps the dispersion into the **settler**. There the droplets fall out in a
+wedge-shaped **dispersion band**, and the light **organic** layer separates above the heavier **aqueous** layer. Organic
+leaves over the **organic weir** and flows *forward* to the mixer of the next stage. Aqueous leaves under the
+**aqueous (underflow) weir** and flows *back* to the mixer of the previous stage. Every mixer therefore receives organic
+from stage n−1 and aqueous from stage n+1: this is **counter-current** flow, built from stages that are individually
+co-current. **(b)** shows the whole cascade with the names used throughout this notebook.
+"""),
+        mo.Html(mixer_settler_detail_svg()),
+        mo.Html(cascade_overview_svg(example="Default Pr|Nd example: n_Ext = 10 extraction stages, n_Scr = 10 scrub stages, "
+                                             "N = 20; S = 2.9, W = 0.45 per unit feed; pH 1.9 / 1.8.")),
+        mo.md(r"""
+| Name | Symbol | Where | Meaning |
+|---|---|---|---|
+| Stage $n$ | $n = 1 \dots N$ | One mixer + one settler | Numbered from the raffinate end. $N = n_{Ext} + n_{Scr}$ |
+| Extraction section | stages $1 \dots n_{Ext}$ | Between the solvent inlet and the feed | Heavy element is pulled into the organic. Aqueous flow $W + F$, pH = extraction pH |
+| Feed stage | $f = n_{Ext}$ | Last extraction stage | Where the feed joins the aqueous flow |
+| Scrub section | stages $n_{Ext}+1 \dots N$ | Between the feed and the scrub inlet | Light element is washed back out of the organic. Aqueous flow $W$, pH = scrub pH |
+| Feed | $F$, $c_F$ | Into stage $f$ (aqueous) | The mixed rare-earth solution to be separated |
+| Fresh (barren) organic | $S$ | Into stage 1 (organic) | Metal-free solvent, regenerated by stripping in a real plant |
+| Scrub liquor | $W$ | Into stage $N$ (aqueous) | Dilute acid that scrubs the loaded organic |
+| Raffinate | $L_1 x_1$ | Out of stage 1 (aqueous) | **Light product** |
+| Loaded organic (extract) | $S\,y_N$ | Out of stage $N$ (organic) | **Heavy product**. Goes to stripping in a real plant |
+| Stage concentrations | $x_n$, $y_n$ | Settler $n$ outlets | Aqueous and organic concentrations leaving stage $n$ (mixer values $x_m, y_m$ in the dynamic model) |
+| Organic between stages | $y_{n-1} \to$ mixer $n$ | Over the organic weirs | Flows towards higher $n$ |
+| Aqueous between stages | $x_{n+1} \to$ mixer $n$ | Under the aqueous weirs | Flows towards lower $n$ |
+
+The same layout, with live concentrations and the control instruments added, is the P&ID in **Lab 11**.
+"""),
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(PAGES, mo, nav):
+    mo.stop(nav.value != PAGES[0])
+    mo.md(
+        r"""
+#### A1.10 A complete SX circuit
 A working circuit is a closed loop for the solvent:
 
 1. **Extraction.** The loaded organic takes up the more extractable metals, and the aqueous raffinate leaves with the less extractable ones.
@@ -1363,7 +1601,7 @@ A working circuit is a closed loop for the solvent:
 This lab models only **extraction + scrubbing at fixed pH**. Fixed pH is the idealisation of perfect saponification
 or acid control, and the solvent is assumed to arrive metal-free from a perfect stripping section.
 
-#### A1.10 How a rare-earth refinery is organised
+#### A1.11 How a rare-earth refinery is organised
 A mixed rare-earth feed is separated by a sequence of **binary cuts**. Each cascade divides the feed between two
 **key elements** that are neighbours in the extraction order. For example, a first cascade might split light rare earths
 (La–Nd) from medium and heavy ones (Sm onwards) at the Nd|Sm cut, and later cascades take Pr|Nd, La|Ce and so on. The
@@ -1506,7 +1744,7 @@ It is linear with slope $D$ at low $x$ and flattens to $Q$ (83.3 mmol/L at C = 0
 > $(O/A)_{min} = 40/66.0 = 0.61$. Below it, even 30 stages leave Nd in the raffinate (try O/A = 0.6).
 
 ### A8 · The extraction / scrub cascade  → *Lab 5*
-To split a binary feed into **two** pure products, the feed enters the **middle** of a cascade:
+To split a binary feed into **two** pure products, the feed enters the **middle** of a cascade (Figure A1b in A1.9):
 
 * **Numbering.** Stages $1..N$, $N = n_{Ext} + n_{Scr}$. The **extraction section** is $1..n_{Ext}$ and the
   **scrub section** is $n_{Ext}+1..N$. The feed is at $f = n_{Ext}$.
@@ -2180,7 +2418,7 @@ def _(PAGES, mo, nav):
         "The lab has two halves of equal weight. **Part A, Separations** (sections 1–5) goes from one equilibrium "
         "contact to a full extraction/scrub cascade. **Part B, Process dynamics and control** (sections 6–11) turns that "
         "cascade into a mixer-settler plant and controls it. Every chart updates live. Each section has a matching "
-        "concept section on page 1, and the code is on page 3.\n\n"
+        "background chapter on page 1 (Background), and the code is on page 3.\n\n"
         "---\n## Part A · Separations"
     )
     return
@@ -2494,7 +2732,7 @@ def _(PAGES, mo, nav):
         "---\n## Part B · Process dynamics and control\n"
         "Sections 6–11 build the section 5 cascade as a plant of real mixer-settlers. They use the same pair, stages, "
         "S and W (scaled by the feed flow F) and pH values. You can then watch the plant fill, find "
-        "its step response, tune a PI controller and reject disturbances. The concepts are in **Part B** of page 1."
+        "its step response, tune a PI controller and reject disturbances. The background is in **Part B** of page 1 (Background)."
     )
     return
 
@@ -3012,6 +3250,7 @@ def _(
     mo,
     nav,
     new_figure,
+    mixer_settler_detail_svg,
     pid_svg,
     run_tests,
     simulate_disturbance,
@@ -3039,6 +3278,7 @@ def _(
         ("Step test, FOPDT fit, SIMC tuning, P/PI/feedforward control and disturbances", simulate_disturbance),
         ("Frequency response, stability margins and PI tuning rules", stability_margins),
         ("Interactive P&ID drawing (SVG)", pid_svg),
+        ("Mixer-settler connection diagrams (Figure A1)", mixer_settler_detail_svg),
         ("Tests", run_tests),
         ("Plotting helpers", new_figure),
     ]
